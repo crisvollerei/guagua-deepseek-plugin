@@ -41,7 +41,7 @@ guagua-deepseek-plugin/
 | 配置项 | 说明 |
 |---|---|
 | `deepseek.baseURL` / `deepseek.apiKey` | DeepSeek 接口地址与密钥（**必须替换**） |
-| `deepseek.defaultModel` / `models` | 默认模型与 `#ds切换模型` 的模型映射（默认官方命名 `deepseek-chat` / `deepseek-reasoner`，使用第三方网关时请改为网关支持的模型名） |
+| `deepseek.defaultModel` / `models` | 默认模型与 `#ds切换模型` 的模型映射（默认官方命名 `deepseek-v4-flash` / `deepseek-v4-pro`，使用第三方网关时请改为网关支持的模型名） |
 | `webSearch.apiKey` / `apiUrl` / `enabled` | 联网搜索（Ollama Web Search Cloud API）密钥、地址与开关（**密钥必须替换**） |
 | `command.chatPrefix` / `reset` / `companion` / `adminPrefix` | 各命令触发前缀（需以 `#` 开头） |
 | `chat.*` | 对话默认参数（上下文长度 / 群聊记录长度 / 温度 / 思考过程显示），运行时被 redis 中已保存的配置覆盖 |
@@ -58,8 +58,9 @@ guagua-deepseek-plugin/
 2. 注册 / 登录后，进入 **API Keys** 页面
 3. 点击「创建 API Key」，复制生成的 `sk-` 开头的密钥（**只显示一次，请立即保存**）
 4. 官方模型名对照：
-   - `deepseek-chat`：通用对话模型（默认使用）
-   - `deepseek-reasoner`：深度思考模型（`#ds切换模型 pro` 切换）
+   - `deepseek-v4-flash`：通用对话模型（默认使用）
+   - `deepseek-v4-pro`：深度思考模型（`#ds切换模型 pro` 切换）
+   - 历史命名 `deepseek-chat` / `deepseek-reasoner` 官方仍保持兼容
 
 ### 第 2 步：获取 Ollama Web Search Key（可选，用于联网搜索）
 

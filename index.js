@@ -484,7 +484,7 @@ export class DeepSeek extends plugin {
   // 切换模型/模式
   async switchModel(e) {
     const param = e.msg.replace(`${CMD.adminPrefix}切换模型`, '').trim().toLowerCase();
-    // 模型名映射来自 config.deepseek.models（默认官方命名 deepseek-chat / deepseek-reasoner；
+    // 模型名映射来自 config.deepseek.models（默认官方命名 deepseek-v4-flash / deepseek-v4-pro；
     // 若使用第三方网关/中转端点，请修改 config.js 中的映射）
     const modelMap = config.deepseek.models;
     const modeMap = { '友好': 'default', '毒舌': 'sarcastic', '严肃': 'serious' };

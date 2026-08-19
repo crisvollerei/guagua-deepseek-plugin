@@ -25,14 +25,15 @@ export const config = {
     // ！！！请替换为你自己的 API Key，切勿泄露！！！
     apiKey: process.env.DEEPSEEK_API_KEY || 'your_deepseek_api_key_here',
 
-    // 默认模型名（官方通用命名：deepseek-chat / deepseek-reasoner）。
+    // 默认模型名（DeepSeek 官方当前命名：deepseek-v4-flash / deepseek-v4-pro）。
+    // 历史命名 deepseek-chat / deepseek-reasoner 官方仍保持兼容，可自行切换。
     // 若使用第三方网关 / 中转端点，请改为该端点支持的模型名。
-    defaultModel: 'deepseek-chat',
+    defaultModel: 'deepseek-v4-flash',
 
     // 「#ds切换模型 flash|pro」可选的模型映射（键为命令参数，值为实际模型名）
     models: {
-      flash: 'deepseek-chat',
-      pro: 'deepseek-reasoner'
+      flash: 'deepseek-v4-flash',
+      pro: 'deepseek-v4-pro'
     },
 
     // 思考模式附加参数（仅端点支持时生效）
