@@ -1,0 +1,21 @@
+# 依赖
+node_modules/
+
+# 环境变量与本地密钥（切勿提交）
+.env
+.env.*
+!.env.example
+
+# 日志
+logs/
+*.log
+
+# 系统与编辑器
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# 本地备份
+*.bak
