@@ -48,11 +48,6 @@ guagua-deepseek-plugin/
 | `companion.*` | 陪伴模式参数（判断/回复冷却、缓冲上限、摘要参数、自动关闭时长等） |
 | `persona.*` | 人设：机器人昵称、主人信息、优先识别名单（`preferredUsers`）、群特殊设定（`groupSettings`）、默认人设模板（`systemPrompt`，支持 `{{botName}}` 等占位符） |
 
-密钥也支持通过环境变量覆盖（不修改文件即可换 Key）：
-
-- `DEEPSEEK_API_KEY` / `DEEPSEEK_BASE_URL`
-- `OLLAMA_API_KEY`
-
 ## 配置流程（详细版）
 
 按以下步骤即可完成插件的完整配置：
@@ -72,9 +67,9 @@ guagua-deepseek-plugin/
 2. 生成 API Key（形如 `uuid.token`）
 3. 如果不需要联网搜索功能，可将 `config.webSearch.enabled` 改为 `false`，跳过本步
 
-### 第 3 步：填入配置（两种方式任选其一）
+### 第 3 步：填入配置（直接编辑 `config.js`）
 
-**方式 A：直接编辑 `config.js`**
+打开 `config.js`，将密钥直接填入对应字段：
 
 ```js
 deepseek: {
@@ -91,15 +86,7 @@ persona: {
 }
 ```
 
-**方式 B：环境变量（推荐，密钥不进仓库）**
-
-```bash
-# 在启动机器人的 shell 中设置（Windows CMD 用 set，PowerShell 用 $env:）
-export DEEPSEEK_API_KEY=sk-你的DeepSeek密钥
-export OLLAMA_API_KEY=你的Ollama密钥
-```
-
-环境变量的优先级高于 `config.js` 中的默认值，两种方式都设置时以环境变量为准。
+保存后即生效，无需其他操作。
 
 ### 第 4 步：安装依赖并重启
 
@@ -116,8 +103,8 @@ npm install openai axios   # 在 trss-yunzai 项目根目录执行
 
 ### 安全提醒
 
-- `config.js` 中的 `your_deepseek_api_key_here` / `your_ollama_api_key_here` 仅为占位符，请务必替换
-- 请勿把真实密钥提交到公开仓库（推荐方式 B 环境变量管理密钥）
+- `config.js` 中的 `your_deepseek_api_key_here` / `your_ollama_api_key_here` 仅为占位符，请务必替换为你的真实密钥
+- 本仓库为公开仓库，**请勿把真实密钥提交到仓库**：本地使用可填写真实密钥，推送 / 分享前请将密钥恢复为占位符
 - 若怀疑密钥泄露，请立即到对应平台吊销并重新生成
 
 ## 命令
