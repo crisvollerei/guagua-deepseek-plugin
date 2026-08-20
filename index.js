@@ -429,11 +429,22 @@ export class DeepSeek extends plugin {
         { reg: `^${escapeRegExp(CMD.adminPrefix)}设置思考过程(.*)$`, fnc: 'setForwardMsg', permission: 'master' },
         { reg: `^${escapeRegExp(CMD.adminPrefix)}切换模型(flash|pro|友好|毒舌|严肃)$`, fnc: 'switchModel', permission: 'master' },
         { reg: `^${escapeRegExp(CMD.adminPrefix)}思考模式(开启|关闭)$`, fnc: 'toggleThinking', permission: 'master' },
-        { reg: `^${escapeRegExp(CMD.adminPrefix)}切换模式(.*)$`, fnc: 'switchMode', permission: 'master' },
-        // 兜底规则：匹配所有消息，用于陪伴模式监听群聊（内部会快速过滤）
-        { reg: '^[\\s\\S]*$', fnc: 'companionMonitor' }
+        { reg: `^${escapeRegExp(CMD.adminPrefix)}切换模式(.*)$`, fnc: 'switchMode', permission: 'master' }
       ]
     });
+  }
+
+  // 陪伴模式监听入口（框架 accept 钩子）
+  // 注意：不能用"匹配所有消息的规则"监听——TRSS-Yunzai 的 loader 中，规则一旦匹配并执行 fnc，
+  // 框架立即 return 终止整个消息分发，会导致其他插件（如 #更新面板 等命令）收不到消息。
+  // accept 在规则匹配之前对所有插件依次调用，返回 false 不会阻止其他插件处理。
+  async accept(e) {
+    try {
+      await this.companionMonitor(e);
+    } catch (err) {
+      logger.error(`[DeepSeek-陪伴] 监听异常:`, err);
+    }
+    return false; // 不阻止其他插件
   }
 
   // 帮助命令
