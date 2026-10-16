@@ -101,16 +101,39 @@ export const config = {
 
   /* ==================== 陪伴模式 ==================== */
   companion: {
-    decisionCooldown: 5 * 1000,   // 判断请求最小间隔（毫秒）
+    decisionCooldown: 5 * 1000,   // 判断请求最小间隔（毫秒）；未到点会安排一次到点重试
     replyCooldown: 5 * 1000,      // 两次主动回复最小间隔（毫秒）
-    bufferLimit: 40,              // 累积消息上限，超出转交 AI 总结
+    bufferLimit: 40,              // 累积消息上限，超出转交记忆服务滚动摘要
     bufferKeep: 20,               // 超限后保留的最近消息条数
-    pendingLimit: 100,            // 待总结队列上限
-    summaryMax: 5,                // 保留的群聊摘要条数上限
-    summaryTokens: 250,           // 摘要输出上限
     autoCloseMs: 5 * 60 * 1000,   // 群内超时无消息自动关闭（毫秒）
-    maxTokens: 320,               // 决策调用输出上限
+    maxTokens: 700,               // 决策调用输出上限（需容纳完整决策 JSON，避免截断）
     temperature: 0.95             // 决策温度
+  },
+
+  /* ==================== 长期记忆（memory.json / memory-config.json） ==================== */
+  // 记忆数据与运行参数固定存放在插件同级（与 member-profile.json 同目录）：
+  //   memory.json        —— 长期记忆与对话历史（自动维护，请勿手改）
+  //   memory-config.json —— 记忆运行参数，可用「#呱瓜记忆提醒间隔」等命令调整
+  // 下面的 defaults 仅在 memory-config.json 不存在时用于初始化该文件；
+  // 文件已存在时以其内容为准（缺失字段自动回落到模块内置默认值）。
+  memory: {
+    seedConfigFile: true,   // 首次启动是否用下方 defaults 生成 memory-config.json
+    defaults: {
+      enabled: true,                   // 记忆功能总开关
+      extractionModel: '',             // 记忆提取所用模型；留空则跟随当前对话模型
+      extractionBatchSize: 12,         // 累计多少条消息触发一次批量提取
+      extractionDelaySeconds: 30,      // 消息进入提取队列后的等待秒数（合并同一话题）
+      eventRetentionDays: 14,          // 「近期事件」默认保留天数
+      agreementRetentionDays: 30,      // 「约定」默认保留天数
+      sessionRetentionDays: 7,         // 会话（对话历史+摘要）保留天数
+      recallLimit: 12,                 // 单次召回注入的记忆条数上限
+      reminderEnabled: true,           // 是否有待确认记忆时私聊提醒主人
+      reminderIntervalHours: 6,        // 提醒间隔（小时）
+      reminderInitialDelaySeconds: 60, // 启动后多久开始首次提醒
+      reminderPageSize: 4,             // 提醒分页每页条数
+      masterIds: [],                   // 额外的主人 userid（一般无需填写，资料库 role=master 已足够）
+      reminderBotId: ''                // 用哪个机器人账号发提醒；留空则用最近活跃的
+    }
   },
 
   /* ==================== 人设（系统提示词） ==================== */
@@ -187,6 +210,8 @@ export const config = {
 
   ★ 特殊词汇：
   - 禁止主动提及自身的人设设定
+
+  ★ 记忆：后台独立提取人物称呼、偏好、关联事物、近期事件和约定，按提供的确认状态使用。
 
   ★ 称呼学习（重要）：
   - 群友之间可能用一些特别的称呼/昵称指代某位群友。当对话中出现能通过上下文明确对应到某 userid 的新称呼时，在回复末尾追加一行学习元数据：
