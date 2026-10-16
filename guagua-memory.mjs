@@ -5,11 +5,24 @@ import { createHash } from 'node:crypto';
 const DAY = 86400000;
 const TYPES = new Set(['alias', 'preference', 'fact', 'entity', 'event', 'agreement']);
 const TEMPORARY = new Set(['event', 'agreement']);
+const CONTEXTUAL = new Set(['alias', ...TEMPORARY]);
 const LABELS = { alias: '称呼', preference: '偏好', fact: '个人事实', entity: '关联事物', event: '近期事件', agreement: '约定' };
 const clone = value => JSON.parse(JSON.stringify(value));
 const iso = time => new Date(time).toISOString();
 const digest = value => createHash('sha256').update(String(value)).digest('hex').slice(0, 24);
 const text = (value, length = 600) => String(value ?? '').trim().slice(0, length);
+const recordVersion = r => digest(JSON.stringify([r.type, r.subjectId, r.groupId, r.content, r.status, r.entity, r.replaces, r.expiresAt,
+    ...(r.sessionId ? [r.sessionId] : []), ...(r.shareOnBinding ? ['shareOnBinding'] : [])]));
+const sendFailed = result => result === false || result === null || Boolean(result?.error) || result?.status === 'failed';
+const legacyOrphan = record => !record.subjectId && !record.source?.speakerId && !record.source?.messageId && !record.source?.quote;
+const reviewKey = e => `${sessionKey(e)}:${normalizeId(e.user_id)}`;
+const receiptKeys = value => {
+    if (!value || typeof value !== 'object') return [];
+    const keys = [];
+    for (const id of [value.message_id, value.messageId, value.id]) if (id != null && String(id)) keys.push(`id:${id}`);
+    if (value.seq != null) keys.push(`seq:${value.seq}`, ...(value.time != null ? [`seq:${value.seq}:${value.time}`] : []));
+    return keys;
+};
 export const normalizeId = value => value == null ? '' : String(value);
 export const sessionKey = e => `${normalizeId(e.self_id || e.bot?.uin || 'default')}:${e.group_id ? `group:${e.group_id}` : `private:${e.user_id}`}`;
 
@@ -35,7 +48,8 @@ export const MEMORY_RULES = `
 - 后台会独立提取记忆，包括群友关联的宠物、物品、作品、项目、亲友、兴趣等；普通回复不要输出【MEM】或记忆JSON。
 - 【已确认长期记忆】可作为事实使用；【待确认参考】只是未经主人确认的聊天线索，可用来理解语境，必要时用“你之前好像提过……”或向本人求证，绝不能改称为已确认事实。
 - 【近期事件和约定】按原消息的时间理解，时效内无需主人确认；不要把过期事件当作当前安排。记录约定不代表已经设置自动执行或到点提醒。
-- 同一人的稳定资料可跨群参考；带本群范围的称呼、关系和梗只在对应群使用。遇到冲突优先用人工资料和主人修正后的记忆。
+- 稳定个人信息绑定userid：同一人在多个群的宠物、生日、长期偏好可共用；群内事件、约定、临时偏好、称呼、关系和梗仅在原群或原私聊使用。不可把某群的安排套到另一个群。
+- 跨群稳定个人信息只对当前群已知或本轮涉及的成员召回；同名、相同宠物名或相似关键词不能证明是同一个人。遇到冲突优先用人工资料和主人修正后的记忆。
 - 只在与当前话题相关时自然使用记忆，不要在闲聊中主动罗列他人的资料。`;
 
 export function parseJsonObject(content) {
@@ -55,15 +69,28 @@ function validData(data) {
         Array.isArray(data.records) && data.records.every(r => r && typeof r.id === 'string' && TYPES.has(r.type) && typeof r.content === 'string') &&
         data.sessions && !Array.isArray(data.sessions) && typeof data.sessions === 'object' &&
         Array.isArray(data.observations) && data.members && typeof data.members === 'object' &&
-        data.reminders && typeof data.reminders === 'object';
+        data.reminders && typeof data.reminders === 'object' &&
+        (data.reviews == null || (typeof data.reviews === 'object' && !Array.isArray(data.reviews)));
 }
 
 function freshData() {
-    return { version: 2, nextId: 1, records: [], members: {}, sessions: {}, observations: [], reminders: {}, migratedProfile: false, updatedAt: '' };
+    return { version: 2, nextId: 1, records: [], members: {}, sessions: {}, observations: [], reminders: {}, reviews: {}, migratedProfile: false, updatedAt: '' };
 }
 
 function emptySession(now) {
     return { history: [], summary: '', pendingSummary: [], summaryRetryAt: 0, companion: null, updatedAt: now };
+}
+
+// 兼容旧版误存为全局的事件/称呼；依据原始来源修复，不猜测来源不明的记录。
+function normalizeScopes(data) {
+    for (const record of data.records) {
+        const contextual = CONTEXTUAL.has(record.type) || !record.subjectId;
+        if (!contextual) continue;
+        if (record.source?.groupId) record.groupId = normalizeId(record.source.groupId);
+        if (record.groupId) { delete record.sessionId; continue; }
+        const session = String(record.source?.session || '') || String(record.source?.messageId || '').match(/^([^:]+:private:[^:]+):/)?.[1];
+        if (session?.includes(':private:')) record.sessionId ||= session;
+    }
 }
 
 export class MemoryStore {
@@ -90,6 +117,7 @@ export class MemoryStore {
             if (fs.existsSync(this.file)) {
                 const data = readJson(this.file);
                 if (!validData(data)) throw new Error('memory.json 结构不完整或版本不兼容');
+                normalizeScopes(data);
                 this.data = data;
             }
             this.blocked = '';
@@ -137,6 +165,7 @@ export class MemoryStore {
         if (this.blocked) throw new Error(`记忆文件读取失败，未写入：${this.blocked}`);
         const next = clone(this.data);
         const result = update(next);
+        normalizeScopes(next);
         next.updatedAt = iso(this.now());
         this.write(next);
         this.data = next;
@@ -174,7 +203,7 @@ export class MemoryStore {
 
     addTo(data, record) {
         const existing = data.records.find(r => r.type === record.type && r.subjectId === record.subjectId &&
-            (r.groupId || '') === (record.groupId || '') && r.content === record.content);
+            (r.groupId || '') === (record.groupId || '') && (r.sessionId || '') === (record.sessionId || '') && r.content === record.content);
         if (existing) {
             if (['ignored', 'superseded', 'deleted'].includes(existing.status)) return existing;
             existing.lastSeenAt = iso(this.now());
@@ -198,17 +227,28 @@ export class MemoryStore {
 
     pending() { return this.data.records.filter(r => r.status === 'pending' && this.usable(r)); }
 
-    aliases(uid, groupId) {
-        return this.data.records.filter(r => r.type === 'alias' && r.subjectId === normalizeId(uid) && r.status === 'confirmed' &&
-            this.usable(r) && (!r.groupId || r.groupId === normalizeId(groupId))).map(r => r.content);
+    inScope(record, groupId = '', sessionId = '') {
+        if (record.groupId) return normalizeId(record.groupId) === normalizeId(groupId);
+        if (record.sessionId) return record.sessionId === sessionId;
+        // 缺失原始会话的旧事件不再当作全局安排；旧人工/迁移称呼保持兼容。
+        return !TEMPORARY.has(record.type);
     }
 
-    search({ userIds = [], groupId = '', query = '', limit = this.config.recallLimit } = {}) {
+    aliases(uid, groupId, sessionId = '') {
+        return this.data.records.filter(r => r.type === 'alias' && r.subjectId === normalizeId(uid) && r.status === 'confirmed' &&
+            this.usable(r) && this.inScope(r, groupId, sessionId)).map(r => r.content);
+    }
+
+    search({ userIds = [], groupId = '', sessionId = '', allowedUserIds, subjectIds, query = '', limit = this.config.recallLimit } = {}) {
         const ids = new Set(userIds.map(normalizeId));
+        const allowed = allowedUserIds == null ? null : new Set(allowedUserIds.map(normalizeId));
+        const subjects = subjectIds == null ? null : new Set(subjectIds.map(normalizeId));
         const q = text(query, 2000).toLowerCase();
         const words = [...new Set(q.match(/[a-z0-9]{2,}|[\u3400-\u9fff]{2,}/g) || [])];
         const grams = words.flatMap(w => w.length > 3 ? Array.from({ length: w.length - 1 }, (_, i) => w.slice(i, i + 2)) : [w]);
-        return this.data.records.filter(r => this.usable(r) && (!r.groupId || r.groupId === normalizeId(groupId)))
+        return this.data.records.filter(r => this.usable(r) && this.inScope(r, groupId, sessionId) &&
+            (!subjects || subjects.has(r.subjectId)) &&
+            (r.groupId || r.sessionId || (r.subjectId && (!allowed || allowed.has(r.subjectId)))))
             .map(r => {
                 const body = `${r.content} ${r.entity?.name || ''} ${r.entity?.relation || ''}`.toLowerCase();
                 const matches = grams.reduce((n, w) => n + Number(body.includes(w)), 0);
@@ -227,34 +267,50 @@ export class MemoryStore {
         ];
         return groups.map(([status, heading]) => {
             const lines = records.filter(r => r.status === status).map(r =>
-                `- ${r.id} userid=${r.subjectId || '对象未确定'}；${LABELS[r.type]}：${r.content}${r.groupId ? '（仅本群）' : ''}；来源时间:${r.source?.at || r.createdAt}${r.expiresAt ? `；有效至:${r.expiresAt}` : ''}`);
+                `- ${r.id} userid=${r.subjectId || '对象未确定'}；${LABELS[r.type]}：${r.content}${r.groupId ? '（仅本群）' : r.sessionId ? '（仅本次私聊）' : '（个人稳定信息）'}；来源时间:${r.source?.at || r.createdAt}${r.expiresAt ? `；有效至:${r.expiresAt}` : ''}`);
             return lines.length ? `${heading}\n${lines.join('\n')}` : '';
         }).filter(Boolean).join('\n').slice(0, 6500);
     }
 
     manage(action, id, arg = '', actor = '') {
+        return this.manageMany([{ action, id, arg }], actor)[0];
+    }
+
+    manageMany(operations, actor = '') {
         return this.change(data => {
-            const record = data.records.find(r => r.id.toUpperCase() === id.toUpperCase());
-            if (!record) throw new Error(`没有找到记忆 ${id}`);
-            if (action === '确认') {
-                if (['ignored', 'deleted', 'superseded'].includes(record.status)) throw new Error('这条记录已被忽略、删除或更正');
-                if (arg) record.subjectId = normalizeId(arg);
-                if (!record.subjectId) throw new Error('该记录对象不明，请在编号后补充 userid');
-                record.status = TEMPORARY.has(record.type) ? 'active' : 'confirmed';
-                if (record.replaces) {
-                    const old = data.records.find(r => r.id === record.replaces && r.subjectId === record.subjectId && r.type === record.type);
-                    if (old) old.status = 'superseded';
-                }
-            } else if (action === '修正') {
-                if (!arg.trim()) throw new Error('请填写修正后的内容');
-                record.revisions = [...(record.revisions || []), { content: record.content, entity: record.entity, status: record.status, at: iso(this.now()) }].slice(-10);
-                record.content = text(arg);
-                delete record.entity;
-                record.status = TEMPORARY.has(record.type) ? 'active' : (record.subjectId ? 'confirmed' : 'pending');
-            } else record.status = action === '删除' ? 'deleted' : 'ignored';
-            record.reviewedBy = actor;
-            record.updatedAt = iso(this.now());
-            return clone(record);
+            const changed = [];
+            for (const { action, id, arg = '', expected } of operations) {
+                if (!['确认', '修正', '删除', '忽略'].includes(action)) throw new Error('不支持的记忆操作');
+                const record = data.records.find(r => r.id.toUpperCase() === id.toUpperCase());
+                if (!record) throw new Error(`没有找到记忆 ${id}；本批次未作修改`);
+                if (expected && recordVersion(record) !== expected) throw new Error(`${id} 已变化，请重新查看列表；本批次未作修改`);
+                if (action === '确认') {
+                    if (['ignored', 'deleted', 'superseded'].includes(record.status)) throw new Error('这条记录已被忽略、删除或更正');
+                    if (arg) record.subjectId = normalizeId(arg);
+                    if (!record.subjectId) throw new Error(`${record.id} 缺少对应成员，请填写“#memory 确认 ${record.id} 昵称或QQ号”；本批次未作修改`);
+                    if (record.shareOnBinding && !CONTEXTUAL.has(record.type)) {
+                        record.groupId = '';
+                        delete record.sessionId;
+                        delete record.shareOnBinding;
+                    }
+                    record.status = TEMPORARY.has(record.type) ? 'active' : 'confirmed';
+                    if (record.replaces) {
+                        const old = data.records.find(r => r.id === record.replaces && r.subjectId === record.subjectId && r.type === record.type &&
+                            (r.groupId || '') === (record.groupId || '') && (r.sessionId || '') === (record.sessionId || ''));
+                        if (old) old.status = 'superseded';
+                    }
+                } else if (action === '修正') {
+                    if (!arg.trim()) throw new Error('请填写修正后的内容');
+                    record.revisions = [...(record.revisions || []), { content: record.content, entity: record.entity, status: record.status, at: iso(this.now()) }].slice(-10);
+                    record.content = text(arg);
+                    delete record.entity;
+                    record.status = TEMPORARY.has(record.type) ? 'active' : (record.subjectId ? 'confirmed' : 'pending');
+                } else record.status = action === '删除' ? 'deleted' : 'ignored';
+                record.reviewedBy = actor;
+                record.updatedAt = iso(this.now());
+                changed.push(clone(record));
+            }
+            return changed;
         });
     }
 
@@ -339,16 +395,58 @@ export class MemoryService {
     reset(e) { this.invalidate(e); this.safe(() => this.store.reset(sessionKey(e))); }
     registerBot(bot) { if (bot) this.bots.set(normalizeId(bot.uin || bot.self_id || 'default'), bot); }
 
-    context(options = {}) {
+    identityIds() {
+        return [...new Set([...Object.keys(this.profile().users || {}), ...Object.keys(this.store.data.members),
+            ...this.store.data.records.map(r => r.subjectId).filter(Boolean)])];
+    }
+
+    memberIds(groupId, userIds = [], currentMemberIds) {
+        const ids = new Set(userIds.map(normalizeId).filter(Boolean));
+        if (Array.isArray(currentMemberIds)) {
+            for (const uid of currentMemberIds) ids.add(normalizeId(uid));
+        } else if (groupId) {
+            const gid = normalizeId(groupId);
+            for (const [uid, user] of Object.entries(this.profile().users || {})) if (user.groups?.[gid]) ids.add(uid);
+            for (const [uid, member] of Object.entries(this.store.data.members)) if (member.groups?.[gid]) ids.add(uid);
+            for (const source of [...this.store.data.observations, ...this.store.data.records.map(r => r.source)]) {
+                if (source && normalizeId(source.groupId) === gid && source.speakerId) ids.add(normalizeId(source.speakerId));
+            }
+        }
+        return [...ids].filter(Boolean);
+    }
+
+    memberName(uid, groupId) {
+        const key = normalizeId(uid), user = this.profile().users?.[key], observed = this.store.data.members[key];
+        // 旧版 name 可能是另一群最后出现的名片，无法恢复其所属群时不拿它认人。
+        return user?.groups?.[normalizeId(groupId)]?.name || observed?.groups?.[normalizeId(groupId)]?.name ||
+            user?.name || observed?.nickname || (!observed?.lastSeenAt && observed?.name) || key;
+    }
+
+    names(uid, groupId, sessionId = '') {
+        const key = normalizeId(uid), user = this.profile().users?.[key], observed = this.store.data.members[key];
+        return [...new Set([user?.name, ...(user?.aliases || []), ...(user?.learned || []).map(l => l.alias),
+            observed?.nickname, !observed?.lastSeenAt && observed?.name, user?.groups?.[normalizeId(groupId)]?.name,
+            observed?.groups?.[normalizeId(groupId)]?.name, ...this.store.aliases(key, groupId, sessionId)].filter(Boolean))];
+    }
+
+    recallOptions(options = {}) {
         const query = text(options.query, 3000);
         const ids = new Set((options.userIds || []).map(normalizeId));
-        const users = this.profile().users || {};
-        for (const [uid, member] of Object.entries({ ...this.store.data.members, ...users })) {
-            const names = [member.name, ...(member.aliases || []), ...(member.learned || []).map(l => l.alias), ...this.store.aliases(uid, options.groupId)];
-            if (names.some(name => name && query.includes(name))) ids.add(uid);
+        const visible = options.groupId ? new Set(this.memberIds(options.groupId, [...ids], options.memberIds)) : null;
+        const identities = new Map();
+        for (const uid of this.identityIds()) {
+            if (visible && !visible.has(uid)) continue;
+            for (const name of [...this.names(uid, options.groupId, options.sessionId), ...(options.memberNames?.[uid] || [])]) {
+                if (!query.includes(name)) continue;
+                if (!identities.has(name)) identities.set(name, new Set());
+                identities.get(name).add(uid);
+            }
         }
-        return this.store.context({ ...options, userIds: [...ids] });
+        for (const matches of identities.values()) if (matches.size === 1) ids.add([...matches][0]);
+        return { ...options, userIds: [...ids], ...(visible ? { allowedUserIds: [...visible] } : {}) };
     }
+
+    context(options = {}) { return this.store.context(this.recallOptions(options)); }
 
     runSession(e, task) {
         const token = this.token(e);
@@ -367,7 +465,7 @@ export class MemoryService {
         }
         const timestamp = Number(e.time);
         return { id: `${sessionKey(e)}:${id}`, session: sessionKey(e), speakerId: normalizeId(e.user_id),
-            groupId: normalizeId(e.group_id), name: text(e.sender?.card || e.sender?.nickname || e.user_id, 60),
+            groupId: normalizeId(e.group_id), name: text(e.sender?.card || e.sender?.nickname || e.user_id, 60), nickname: text(e.sender?.nickname, 60),
             at: iso(Number.isFinite(timestamp) && timestamp > 0 ? (timestamp < 1e12 ? timestamp * 1000 : timestamp) : this.now()),
             text: text(content, 3000), botId: normalizeId(e.self_id || e.bot?.uin), targets: (e.message || []).filter(s => s.type === 'at').map(s => normalizeId(s.qq)) };
     }
@@ -377,7 +475,13 @@ export class MemoryService {
         if (!this.store.config.enabled || !content?.trim()) return;
         const source = this.source(e, content);
         this.safe(() => this.store.change(data => {
-            data.members[source.speakerId] = { name: source.name, lastSeenAt: source.at };
+            const member = data.members[source.speakerId] ||= {};
+            if (source.nickname) { member.nickname = source.nickname; member.name = source.nickname; }
+            member.lastSeenAt = source.at;
+            if (source.groupId) {
+                member.groups ||= {};
+                member.groups[source.groupId] = { ...member.groups[source.groupId], name: source.name, lastSeenAt: source.at };
+            }
             if (!data.observations.some(o => o.id === source.id)) data.observations.push({ ...source, readyAt: this.now() + (immediate ? 0 : this.store.config.extractionDelaySeconds * 1000), attempts: 0 });
             if (data.observations.filter(o => o.session === source.session && !o.attempts).length >= this.store.config.extractionBatchSize) {
                 for (const observation of data.observations) if (observation.session === source.session && !observation.attempts) observation.readyAt = this.now();
@@ -417,6 +521,8 @@ export class MemoryService {
                 if (subjectId && !allowed.has(subjectId)) continue;
                 if (TEMPORARY.has(raw.type) && !subjectId) continue;
                 const temporary = TEMPORARY.has(raw.type);
+                // 稳定信息必须明确选择 global 且有对应人；事件、约定和自动称呼始终保留会话范围。
+                const global = raw.scope === 'global' && !CONTEXTUAL.has(raw.type) && Boolean(subjectId);
                 const now = this.now();
                 let expiresAt = '';
                 if (temporary) {
@@ -426,9 +532,11 @@ export class MemoryService {
                     expiresAt = iso(Number.isFinite(explicit) ? explicit : Date.parse(source.at) + retention * DAY);
                 }
                 const record = {
-                    type: raw.type, subjectId, groupId: raw.scope === 'group' ? source.groupId : '',
+                    type: raw.type, subjectId, groupId: global ? '' : normalizeId(source.groupId),
+                    ...(!global && !source.groupId && source.session ? { sessionId: source.session } : {}),
+                    ...(raw.scope === 'global' && !CONTEXTUAL.has(raw.type) && !subjectId ? { shareOnBinding: true } : {}),
                     content: text(raw.content, raw.type === 'alias' ? 40 : 600), status: temporary ? (Date.parse(expiresAt) > now ? 'active' : 'expired') : 'pending',
-                    source: { speakerId: source.speakerId, messageId: source.id, groupId: source.groupId, at: source.at, quote: evidence },
+                    source: { speakerId: source.speakerId, messageId: source.id, groupId: source.groupId, session: source.session, at: source.at, quote: evidence },
                     ...(expiresAt ? { expiresAt } : {})
                 };
                 if (raw.type === 'entity' && raw.entity && typeof raw.entity === 'object') {
@@ -452,14 +560,16 @@ export class MemoryService {
         const ids = new Set(batch.map(s => s.id));
         this.extracting = true;
         try {
-            const existing = this.store.search({ userIds: batch.map(s => s.speakerId), groupId: first.groupId, query: batch.map(s => s.text).join(' '), limit: 16 });
+            const existing = this.store.search(this.recallOptions({ userIds: batch.flatMap(s => [s.speakerId, ...(s.targets || [])]),
+                groupId: first.groupId, sessionId: first.session, query: batch.map(s => s.text).join(' '), limit: 16 }));
             const result = await this.complete({
                 model: this.store.config.extractionModel || undefined,
                 messages: [{ role: 'system', content: `你是群聊记忆提取器。只提取消息明确出现、以后有用的信息，返回一个JSON对象，不要输出其他内容。
 类型：alias称呼；preference偏好；fact稳定事实；entity与某成员有关的宠物、物品、作品、项目、亲友等；event近期事件；agreement约定。
 尤其要提取“我养了只猫叫豆包”“我的电脑是…”这类人物与事物的关联，不要只记名字。entity字段记录名称、种类、关系和已明确的属性。
 userid必须准确对应人物，“我/我的宠物”归发言人；对方说自己的信息，不能归给被引用者。引用内容仅作语境，不能误认成本人自述。
-除event/agreement外全部为待主人确认；事件和约定免确认，有时效。scope为global或group：个人偏好、宠物等稳定个人信息默认global；本群称呼、梗和群内关系为group。
+称呼只提取明确的自称、别称或称呼关系，不要因为昵称、群名片或@显示名出现过就收录。无法判断称呼属于谁时保留来源而不填userid，绝不能默认归给说话人。
+除event/agreement外全部为待主人确认；事件和约定免确认，有时效。scope必须填写global或group：与userid绑定的宠物、生日、长期偏好等稳定个人信息为global；近期事件、约定、临时偏好、称呼、梗和群内关系必须为group。一个人在多群的稳定信息可共用，但某群的活动和关系不外推到其他群；程序会将遗漏/无效scope保留在原会话。
 不要把玩笑、猜测、否定句、模型自己的回复当事实；无信息返回memories:[]。每条必须给出原消息source_id和能在该消息中逐字找到的evidence。
 结合每条消息的北京时间理解“明天/下周”；expires_at只在明确时间可判断时填写带+08:00的ISO截止时间，不明确则留空，由程序设置默认期限。绝不要把稳定事实伪装为事件绕过确认。
 已存在的相同记忆无需重复；明确更正旧信息时replaces填旧记忆编号，旧已确认事实在主人确认更正前继续保留，新更正仍为待确认。
@@ -514,24 +624,171 @@ userid必须准确对应人物，“我/我的宠物”归发言人；对方说�
         return [...new Set([...this.store.config.masterIds, ...Object.entries(this.profile().users || {}).filter(([, u]) => u.role === 'master').map(([uid]) => uid)])];
     }
 
+    managementText(e) {
+        if (e.message?.some(part => part.type === 'at' && normalizeId(part.qq) !== normalizeId(e.self_id || e.bot?.uin))) {
+            return e.message.map(part => part.type === 'text' ? part.text : part.type === 'at' && normalizeId(part.qq) !== normalizeId(e.self_id || e.bot?.uin) ? ` ${part.qq}` : '').join('').trim();
+        }
+        return String(e.msg || e.raw_message || '').trim();
+    }
+
+    beginReview(e, records, { reuse = false } = {}) {
+        const key = reviewKey(e);
+        const fingerprint = digest(`${this.store.config.reminderPageSize}:${records.map(r => `${r.id}:${recordVersion(r)}`).join('|')}`);
+        const previous = this.store.data.reviews?.[key]?.at(-1);
+        if (reuse && previous?.fingerprint === fingerprint && this.now() - previous.at < DAY) return previous;
+        const review = { token: digest(`${key}:${this.now()}:${fingerprint}`), at: this.now(), fingerprint,
+            ids: records.map(r => r.id), versions: Object.fromEntries(records.map(r => [r.id, recordVersion(r)])), receipts: [], shownIds: [] };
+        this.store.change(data => {
+            data.reviews ||= {};
+            for (const [context, reviews] of Object.entries(data.reviews)) {
+                const recent = reviews.filter(r => this.now() - r.at < 7 * DAY).slice(-7);
+                if (recent.length) data.reviews[context] = recent; else delete data.reviews[context];
+            }
+            data.reviews[key] = [...(data.reviews[key] || []), review];
+        });
+        return review;
+    }
+
+    rememberReceipt(e, review, receipt, shownIds = review.ids) {
+        const keys = receiptKeys(receipt);
+        this.store.change(data => {
+            const stored = data.reviews?.[reviewKey(e)]?.find(r => r.token === review.token);
+            if (stored) {
+                stored.receipts = [...new Set([...stored.receipts, ...keys])];
+                stored.shownIds = [...new Set([...(stored.shownIds || []), ...shownIds])];
+                stored.delivered = true;
+            }
+        });
+    }
+
+    reviewFor(e) {
+        const reviews = this.store.data.reviews?.[reviewKey(e)] || [];
+        const source = e.source || e.reply_to;
+        const keys = [...receiptKeys(source), ...(e.reply_id ? [`id:${e.reply_id}`] : []), ...(e.message || []).filter(p => p.type === 'reply').flatMap(receiptKeys)];
+        if (source || keys.length) {
+            if (source?.user_id && normalizeId(source.user_id) !== normalizeId(e.self_id || e.bot?.uin)) return null;
+            return [...reviews].reverse().find(r => r.delivered && this.now() - r.at < 7 * DAY && keys.some(key => r.receipts.includes(key))) || null;
+        }
+        const latest = [...reviews].reverse().find(r => r.delivered);
+        return latest && this.now() - latest.at < DAY ? latest : null;
+    }
+
+    resolveSubject(input, groupId) {
+        const target = input.trim().replace(/^@/, '').replace(/^\[CQ:at,qq=(\d+)[^\]]*\]$/, '$1');
+        if (/^\d+$/.test(target)) return target;
+        const ids = new Set();
+        for (const uid of this.identityIds()) {
+            const names = this.names(uid, groupId);
+            if (names.includes(target)) ids.add(uid);
+        }
+        if (ids.size !== 1) throw new Error(ids.size ? `“${target}”对应多个成员，请改用QQ号或@成员` : `找不到成员“${target}”，请改用QQ号或@成员`);
+        return [...ids][0];
+    }
+
+    selectRecords(selector, review) {
+        const pending = this.reviewRecords(this.store.pending());
+        const scoped = review ? pending.filter(r => (review.shownIds || review.ids).includes(r.id)) : pending;
+        if (['全部', '所有', '旧记录', '旧称呼', '对象明确'].includes(selector)) {
+            return { ids: scoped.filter(r => ['旧记录', '旧称呼'].includes(selector) ? legacyOrphan(r) : selector === '对象明确' ? r.subjectId : true).map(r => r.id), aggregate: true };
+        }
+        const tokens = selector.replace(/\s*([-~～—至到,，、])\s*/g, '$1').split(/[\s,，、]+/).filter(Boolean);
+        if (!tokens.length) throw new Error('请填写序号或M编号');
+        const ids = new Set();
+        for (const token of tokens) {
+            const m = token.match(/^(M?)(\d+)(?:[-~～—至到](M?)(\d+))?$/i);
+            if (!m || (!m[1] && m[3])) throw new Error(`无法识别“${token}”，请用 1,3-5 或 M6-M9`);
+            const start = Number(m[2]), end = Number(m[4] || m[2]);
+            if (start < 1 || end < start || end - start > 1000) throw new Error('序号范围无效，请按列表填写');
+            for (let n = start; n <= end; n++) {
+                const id = m[1] ? `M${String(n).padStart(6, '0')}` : review?.ids[n - 1];
+                if (!id) throw new Error(review ? `列表没有第 ${n} 项；本批次未作修改` : '使用短序号前请先查看待确认列表，或直接使用 M编号');
+                if (!m[1] && !(review.shownIds || review.ids).includes(id)) throw new Error(`第 ${n} 项所在页面尚未成功展示，请先重新查看列表`);
+                if (!m[1] && review.versions?.[id] !== recordVersion(this.store.data.records.find(r => r.id === id) || {})) throw new Error(`第 ${n} 项已变化，请重新查看列表后处理`);
+                ids.add(id);
+            }
+        }
+        return { ids: [...ids], aggregate: false };
+    }
+
+    parseReviewLine(line) {
+        line = line.trim().replace(/[。！!]$/, '');
+        let m = line.match(/^([Mm\d][Mm\d\s,，、\-~～—至到]*|全部|所有|旧记录|旧称呼)\s*(?:属于|归给|是)\s*(.+)$/);
+        if (m) return { action: '确认', selector: m[1].trim(), target: m[2].trim() };
+        m = line.match(/^(确认|归属|忽略|删除)\s*(.+)$/);
+        if (m) {
+            const action = m[1] === '归属' ? '确认' : m[1];
+            const rest = m[2].trim().replace(/\s*([-~～—至到,，、])\s*/g, '$1');
+            const parts = rest.match(/^(\S+)(?:\s+([\s\S]+))?$/);
+            if (action !== '确认' && parts[2]) throw new Error('多个序号请用逗号或范围连接，例如“忽略 1,3-5”');
+            if (m[1] === '归属' && !parts[2]) throw new Error('用法：归属 1-3 昵称或QQ号');
+            return { action, selector: parts[1], target: (parts[2] || '').replace(/^(?:属于|归给|是)\s+/, '') };
+        }
+        m = line.match(/^(.+?)\s*(确认|忽略|删除)$/);
+        if (m) return { action: m[2], selector: m[1].trim(), target: '' };
+        throw new Error('可用：#memory 确认全部、#memory 1-3 是 昵称或QQ号、#memory 忽略 4-8；多组操作可以分行填写');
+    }
+
+    planReview(e, input, { replyOnly = false } = {}) {
+        const review = this.reviewFor(e, replyOnly);
+        if (replyOnly && !review) throw new Error('请先查看待确认列表，再按列表序号处理');
+        const lines = input.replace(/^#memory(?:\s+|$)/, '').split(/[\n;；]+/).map(s => s.trim()).filter(Boolean);
+        if (!lines.length) throw new Error('请填写要处理的记忆');
+        const operations = [], skipped = [];
+        const used = new Set();
+        for (const line of lines) {
+            const { action, selector, target } = this.parseReviewLine(line);
+            const selected = this.selectRecords(selector, review);
+            const uid = target ? this.resolveSubject(target, e.group_id) : '';
+            for (const id of selected.ids) {
+                const original = this.store.data.records.find(r => r.id === id);
+                if (action === '确认' && selected.aggregate && !uid && !original?.subjectId) { skipped.push(id); continue; }
+                if (used.has(id)) throw new Error(`${id} 在本批次中出现多次，请每条只处理一次`);
+                used.add(id);
+                if (selected.aggregate && review?.versions?.[id] !== undefined && review.versions[id] !== recordVersion(original)) throw new Error(`${id} 已变化，请重新查看列表后处理`);
+                operations.push({ action, id, arg: uid, ...(original ? { expected: recordVersion(original) } : {}) });
+            }
+        }
+        return { operations, skipped };
+    }
+
     display(record) {
-        const name = this.profile().users?.[record.subjectId]?.name || this.store.data.members[record.subjectId]?.name || record.subjectId || '对象未确定';
-        return `${record.id}｜${LABELS[record.type]}｜${name}${record.subjectId ? `（${record.subjectId}）` : ''}\n${record.content}${record.groupId ? `\n范围：群 ${record.groupId}` : '\n范围：跨群个人信息'}\n来源：${record.source?.at || record.createdAt}${record.source?.groupId ? `，群 ${record.source.groupId}` : ''}${record.source?.quote ? `\n原话：${text(record.source.quote, 180)}` : ''}${record.expiresAt ? `\n有效至：${record.expiresAt}` : ''}`;
+        const name = record.subjectId ? this.memberName(record.subjectId, record.source?.groupId || record.groupId) : '对应成员待识别';
+        if (legacyOrphan(record)) return `${record.id}｜旧${LABELS[record.type]}待归属\n${record.content}\n记录日期：${record.source?.at || record.createdAt}`;
+        const speaker = record.source?.speakerId;
+        const speakerName = speaker && this.memberName(speaker, record.source?.groupId || record.groupId);
+        const state = { confirmed: '已确认', pending: '待确认参考', active: '时效内免确认' }[record.status] || record.status;
+        return `${record.id}｜${LABELS[record.type]}｜${name}${record.subjectId ? `（${record.subjectId}）` : ''}\n[${state}] ${record.content}${record.groupId ? `\n范围：群 ${record.groupId}` : record.sessionId ? '\n范围：原私聊会话' : TEMPORARY.has(record.type) ? '\n范围：原会话缺失，暂停自动召回' : record.subjectId ? '\n范围：跨群个人信息' : '\n对应成员尚待识别，不能归到说话人名下'}\n来源：${record.source?.at || record.createdAt}${record.source?.groupId ? `，群 ${record.source.groupId}` : ''}${speaker ? `\n说话人：${speakerName}（${speaker}）` : ''}${record.source?.quote ? `\n原话：${text(record.source.quote, 180)}` : ''}${record.expiresAt ? `\n有效至：${record.expiresAt}` : ''}`;
     }
 
     pages(records, title, commands = true) {
         const pages = [];
         const size = this.store.config.reminderPageSize;
+        const old = records.filter(legacyOrphan).length;
+        const note = old ? `\n其中 ${old} 条为旧记录：只保留了名称和日期，对应成员、原话和群范围均未保存。可批量指定归属或忽略。` : '';
+        const example = records.length > 1 ? `1-${Math.min(3, records.length)}` : '1';
         for (let i = 0; i < records.length; i += size) {
-            pages.push(`${title}（${i + 1}-${Math.min(i + size, records.length)}/${records.length}）\n\n${records.slice(i, i + size).map(r => this.display(r)).join('\n\n')}${commands ? '\n\n确认：#呱瓜记忆确认 M编号 [userid]\n修正：#呱瓜记忆修正 M编号 正确内容\n忽略：#呱瓜记忆忽略 M编号\n近期事件和约定免确认；以上内容在确认前仅作参考。' : ''}`);
+            pages.push(`${title}（${i + 1}-${Math.min(i + size, records.length)}/${records.length}）${i === 0 ? note : ''}\n\n${records.slice(i, i + size).map((r, n) => `${i + n + 1}. ${this.display(r)}`).join('\n\n')}${commands ? `\n\n示例：#memory 确认 ${example} [昵称/QQ号]\n忽略：#memory 忽略 ${example}${old ? '，或 #memory 忽略旧记录' : ''}\n列表后可回复：#memory 确认全部 / #memory ${example} 是 昵称或QQ号 / #memory 忽略 ${example}；一条消息开头带 #memory，可分行处理不同归属。\n序号在本批列表各页连续；确认全部跳过缺少成员的记录。近期事件和约定免确认；未确认内容仅作参考。` : ''}`);
         }
         return pages.length ? pages : [`${title}：暂无`];
+    }
+
+    reviewRecords(records) { return [...records.filter(r => !legacyOrphan(r)), ...records.filter(legacyOrphan)]; }
+
+    async sendReview(e, records, title) {
+        records = this.reviewRecords(records);
+        const review = this.beginReview(e, records);
+        const pages = this.pages(records, title);
+        for (let page = 0; page < pages.length; page++) {
+            const sent = await e.reply(pages[page]);
+            if (sendFailed(sent)) throw new Error('记忆列表发送未成功，请稍后重新查看');
+            this.rememberReceipt(e, review, sent, records.slice(page * this.store.config.reminderPageSize, (page + 1) * this.store.config.reminderPageSize).map(r => r.id));
+        }
     }
 
     async notifyPending(force = false) {
         const config = this.store.config;
         if (!this.active || this.notifying || (!force && !config.reminderEnabled) || (!force && this.now() - this.startedAt < config.reminderInitialDelaySeconds * 1000)) return;
-        const pending = this.store.pending();
+        const pending = this.reviewRecords(this.store.pending());
         if (!pending.length) return;
         const bot = config.reminderBotId ? this.bots.get(normalizeId(config.reminderBotId)) : [...this.bots.values()].at(-1);
         if (!bot) return;
@@ -543,17 +800,20 @@ userid必须准确对应人物，“我/我的宠物”归发言人；对方说�
                 const last = state.lastSentAt || 0;
                 if (!force && state.retryAt > this.now()) continue;
                 if (!force && !state.retryAt && !state.nextPage && this.now() - last < config.reminderIntervalHours * 3600000) continue;
-                const pages = this.pages(pending, '🧠 呱瓜有待确认的记忆，内容如下');
                 try {
                     const target = bot.pickUser?.(master) || bot.pickFriend?.(master);
                     if (!target?.sendMsg) throw new Error('机器人不支持该主人的私聊发送');
-                    const fingerprint = digest(pending.map(r => `${r.id}:${r.updatedAt}`).join('|'));
+                    const event = { user_id: master, self_id: bot.uin || bot.self_id || 'default' };
+                    const review = this.beginReview(event, pending, { reuse: true });
+                    const pages = this.pages(pending, '🧠 呱瓜有待确认的记忆，内容如下');
+                    const fingerprint = review.fingerprint;
                     const previous = this.store.data.reminders[master];
                     let page = previous?.fingerprint === fingerprint ? previous.nextPage || 0 : 0;
                     for (; page < pages.length; page++) {
                         if (!this.active) return;
                         const sent = await target.sendMsg(pages[page]);
-                        if (sent === false || sent === null) throw new Error('私聊发送未成功');
+                        if (sendFailed(sent)) throw new Error('私聊发送未成功');
+                        this.rememberReceipt(event, review, sent, pending.slice(page * config.reminderPageSize, (page + 1) * config.reminderPageSize).map(r => r.id));
                         this.store.change(data => { data.reminders[master] = { ...data.reminders[master], fingerprint, nextPage: page + 1 }; });
                     }
                     this.store.change(data => { data.reminders[master] = { lastSentAt: this.now(), fingerprint, nextPage: 0 }; });

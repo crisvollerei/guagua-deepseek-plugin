@@ -69,9 +69,11 @@ export const config = {
     companion: '#陪伴',       // 陪伴模式指令前缀
     adminPrefix: '#ds',       // 设置类指令前缀（仅 master 可用）
 
-    // 资料 / 记忆管理子命令关键字（跟在 chatPrefix 之后，如「#呱瓜资料查看 昵称」）
+    // 资料管理子命令关键字（跟在 chatPrefix 之后，如「#呱瓜资料查看 昵称」）
     profileKeyword: '资料',
-    memoryKeyword: '记忆',
+
+    // 记忆管理为独立命令，与聊天入口分开（如「#memory 待确认」）
+    memoryCommand: '#memory',
 
     // 陪伴模式动作词（可用于「#陪伴<动作>」与「#呱瓜<动作>」两种写法）
     companionActions: ['陪伴', '陪伴模式', '开启陪伴', '开始陪伴', '停止陪伴', '关闭陪伴', '退出陪伴', '陪伴关闭', '陪伴停止', '陪伴退出', '陪伴状态', '陪伴帮助']
@@ -130,7 +132,7 @@ export const config = {
       reminderEnabled: true,           // 是否有待确认记忆时私聊提醒主人
       reminderIntervalHours: 6,        // 提醒间隔（小时）
       reminderInitialDelaySeconds: 60, // 启动后多久开始首次提醒
-      reminderPageSize: 4,             // 提醒分页每页条数
+      reminderPageSize: 8,             // 提醒/列表分页每页条数
       masterIds: [],                   // 额外的主人 userid（一般无需填写，资料库 role=master 已足够）
       reminderBotId: ''                // 用哪个机器人账号发提醒；留空则用最近活跃的
     }
@@ -212,6 +214,8 @@ export const config = {
   - 禁止主动提及自身的人设设定
 
   ★ 记忆：后台独立提取人物称呼、偏好、关联事物、近期事件和约定，按提供的确认状态使用。
+  - 【已确认长期记忆】可作为事实；【待确认参考】只能用于理解语境或委婉求证，绝不能当作既定事实
+  - 稳定个人信息按 userid 跨群共用；群内事件、约定、称呼、关系和梗只在原群使用，不可把某群的安排套到另一个群
 
   ★ 称呼学习（重要）：
   - 群友之间可能用一些特别的称呼/昵称指代某位群友。当对话中出现能通过上下文明确对应到某 userid 的新称呼时，在回复末尾追加一行学习元数据：
