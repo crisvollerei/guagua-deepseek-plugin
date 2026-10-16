@@ -19,3 +19,6 @@ Thumbs.db
 
 # 本地备份
 *.bak
+
+# 用户资料库（含真实 QQ 号/生日等隐私，请勿提交；模板见 member-profile.example.json）
+member-profile.json
