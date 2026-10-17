@@ -10,9 +10,10 @@
 guagua-deepseek-plugin/
 ├── index.js                    # 插件主文件（命令处理 / 聊天 / 陪伴模式 / 资料与记忆管理）
 ├── config.js                   # 配置文件（密钥、模型、命令前缀、人设、陪伴与记忆参数）
-├── guagua-memory.mjs           # 长期记忆模块（后台提取 / 确认 / 召回 / 摘要，独立可测）
+├── guagua-memory.mjs           # 长期记忆模块（后台提取 / 确认 / 召回 / 摘要）
+├── guagua-roster.mjs           # 群成员表模块（成员范围授权 / 入退群跟踪 / 名单缓存）
 ├── member-profile.example.json # 用户资料库模板（复制为 member-profile.json 后填写）
-├── 记忆功能使用说明.md          # 长期记忆功能详解（行为、命令、参数、迁移）
+├── 记忆功能使用说明.md          # 长期记忆功能详解（行为、命令、参数、数据文件）
 ├── package.json                # 依赖声明（openai、axios）
 ├── LICENSE
 └── README.md                   # 本说明文档
@@ -24,6 +25,7 @@ guagua-deepseek-plugin/
 member-profile.json   # 人工资料库（你填写）
 memory.json           # 长期记忆 + 对话历史（自动维护，勿手改）
 memory-config.json    # 记忆运行参数（首次启动按 config.memory.defaults 生成）
+group-members.json    # 本群成员名单缓存（自动维护）
 ```
 
 ## 安装
@@ -58,7 +60,7 @@ memory-config.json    # 记忆运行参数（首次启动按 config.memory.defau
 | `command.chatPrefix` / `reset` / `companion` / `adminPrefix` | 各命令触发前缀（需以 `#` 开头） |
 | `chat.*` | 对话默认参数（上下文长度 / 群聊记录长度 / 温度 / 思考过程显示 / 多模态图片上限与超时 / 单条消息截断长度），运行时被 redis 中已保存的配置覆盖 |
 | `profile.*` | 用户资料库：文件名、内存缓存时长、学习称呼长度上限 |
-| `memory.*` | 长期记忆：是否用 `defaults` 生成 `memory-config.json`，以及提取批次、各类保留天数、召回条数、提醒周期等初始默认值 |
+| `memory.*` | 长期记忆：是否用 `defaults` 生成 `memory-config.json`，以及提取批次、各类保留天数、召回条数、成员表刷新间隔、提醒周期等初始默认值 |
 | `companion.*` | 陪伴模式参数（判断/回复冷却、缓冲上限、摘要参数、自动关闭时长等） |
 | `persona.*` | 人设：机器人昵称、主人信息、优先识别名单（`preferredUsers`）、群特殊设定（`groupSettings`）、默认人设模板（`systemPrompt`，支持 `{{botName}}` 等占位符） |
 

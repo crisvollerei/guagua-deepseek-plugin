@@ -129,6 +129,7 @@ export const config = {
       agreementRetentionDays: 30,      // 「约定」默认保留天数
       sessionRetentionDays: 7,         // 会话（对话历史+摘要）保留天数
       recallLimit: 12,                 // 单次召回注入的记忆条数上限
+      memberRefreshSeconds: 300,       // 本群成员表刷新间隔（秒）；过短会增加适配器压力
       reminderEnabled: true,           // 是否有待确认记忆时私聊提醒主人
       reminderIntervalHours: 6,        // 提醒间隔（小时）
       reminderInitialDelaySeconds: 60, // 启动后多久开始首次提醒

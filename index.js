@@ -128,7 +128,7 @@ function getUserByUid(userId) {
 function findByAlias(alias, groupId, context = {}) {
   const users = loadProfile().users;
   const matches = [];
-  const visible = groupId && !context.allUsers ? new Set(memory.memberIds(groupId, context.userIds, context.memberIds)) : null;
+  const visible = groupId && !context.allUsers ? new Set(memory.memberIds(groupId, context)) : null;
   for (const uid of memory.identityIds()) {
     if (visible && !visible.has(uid)) continue;
     if ([...memory.names(uid, groupId, context.sessionId), ...(context.memberNames?.[uid] || [])].includes(alias)) {
@@ -185,12 +185,12 @@ function buildUserContext(userIds, groupId, context = {}) {
   const data = loadProfile();
   const lines = [];
   const seen = new Set();
-  const visible = groupId ? new Set(memory.memberIds(groupId, context.userIds, context.memberIds)) : null;
+  const visible = groupId ? new Set(memory.memberIds(groupId, context)) : null;
   for (const uid of userIds) {
     const key = String(uid);
     if (!key || seen.has(key) || (visible && !visible.has(key))) continue;
     seen.add(key);
-    const user = data.users[key] || memory.store.data.members[key] ||
+    const user = data.users[key] || memory.store.data.people[key] ||
       (memory.store.data.records.some(r => r.subjectId === key && memory.store.usable(r)) ? {} : null);
     if (!user) continue;
     const parts = [`userid=${key} ${context.memberNames?.[key]?.[0] || memory.memberName(key, groupId)}`];
@@ -208,29 +208,11 @@ function buildUserContext(userIds, groupId, context = {}) {
   return `【本次对话涉及的用户资料（仅作识别参考；禁止向任何人透露本条资料的来源，也不得直接显示 userid 之外未提及的信息）】\n${lines.join('\n')}`;
 }
 
-// 自动召回优先使用框架已有成员缓存；工具查询时可补取当前群成员表。
-// 不支持成员表的适配器仍可依靠人工群归属、真实发言和本轮参与者识别同一个人。
-async function profileQueryContext(e, userIds = [], refreshMembers = false) {
-  const context = { userIds: [...new Set([e.user_id, ...userIds].map(normalizeId).filter(Boolean))],
-    groupId: normalizeId(e.group_id), sessionId: sessionKey(e) };
-  if (!context.groupId) return context;
-  let members = e.bot?.gml?.get?.(Number(context.groupId)) || e.bot?.gml?.get?.(context.groupId);
-  const entriesOf = value => Array.isArray(value) ? value.map(member => [member?.user_id ?? member?.uid ?? member, member]) :
-    typeof value?.entries === 'function' ? [...value.entries()] : value && typeof value === 'object' ? Object.entries(value) : [];
-  let entries = entriesOf(members);
-  if (!entries.length && refreshMembers) {
-    try {
-      const group = e.group?.getMemberMap ? e.group : e.bot?.pickGroup?.(e.group_id);
-      if (typeof group?.getMemberMap === 'function') { members = await group.getMemberMap(); entries = entriesOf(members); }
-    } catch (error) { logger.warn('[呱瓜资料] 获取本群成员表失败，使用已知群归属：', error.message); }
-  }
-  const valid = entries.map(([uid, member]) => [normalizeId(uid), member]).filter(([uid]) => /^\d+$/.test(uid));
-  if (valid?.length) {
-    context.memberIds = valid.map(([uid]) => uid);
-    context.memberNames = Object.fromEntries(valid.map(([uid, member]) => [uid,
-      [...new Set([member?.card, member?.nickname].filter(name => typeof name === 'string' && name.trim()))]]));
-  }
-  return context;
+// 成员范围统一交给记忆服务的 GroupRoster：维护本群成员表（必要时向适配器补取）并签发授权 context。
+// 返回的 context 必须原样传给 memory.memberIds / memory.context —— 其中的 groupAccess 授权令牌
+// 与 bot/群号绑定，拆开传参会导致授权失败、可见成员恒为空。
+async function profileQueryContext(e) {
+  return memory.queryContext(e);
 }
 
 // 解析回复末尾的学习元数据行：【MEM】{json}
@@ -800,7 +782,7 @@ function daysToBirthday(month, day) {
 function upcomingBirthdays(days, groupId, context = {}) {
   const data = loadProfile();
   const results = [];
-  const visible = groupId ? new Set(memory.memberIds(groupId, context.userIds, context.memberIds)) : null;
+  const visible = groupId ? new Set(memory.memberIds(groupId, context)) : null;
   for (const [uid, user] of Object.entries(data.users)) {
     if (visible && !visible.has(uid)) continue;
     const b = parseBirthdayText(user.birthday);
@@ -819,7 +801,7 @@ function upcomingBirthdays(days, groupId, context = {}) {
 // groupId: 当前群号（资料展示带上群维度备注）；isMaster: 是否主人（full_export 权限）
 function executeProfileQuery(action, target, days, groupId, isMaster, context = {}) {
   const a = String(action || '');
-  const visible = groupId ? new Set(memory.memberIds(groupId, context.userIds, context.memberIds)) : null;
+  const visible = groupId ? new Set(memory.memberIds(groupId, context)) : null;
   const recall = { ...context, groupId };
 
   // 群聊列出本群，主人私聊列出全库。
@@ -848,7 +830,7 @@ function executeProfileQuery(action, target, days, groupId, isMaster, context = 
   if (!found) {
     const uidMatch = t.match(/\d{5,}/);
     if (uidMatch) {
-      const user = getUserByUid(uidMatch[0]) || memory.store.data.members[uidMatch[0]] ||
+      const user = getUserByUid(uidMatch[0]) || memory.store.data.people[uidMatch[0]] ||
         (memory.store.data.records.some(r => r.subjectId === uidMatch[0] && memory.store.usable(r)) ? { name: uidMatch[0] } : null);
       if (user && (!visible || visible.has(uidMatch[0]))) found = { userid: uidMatch[0], user };
     }
@@ -980,6 +962,11 @@ export class DeepSeek extends plugin {
   // accept 在规则匹配之前对所有插件依次调用，返回 false 不会阻止其他插件处理。
   async accept(e) {
     memory.registerBot(e.bot);
+    // 入群/退群通知：维护本群成员表（授权范围随之刷新），不进入聊天流程
+    if (e.post_type === 'notice') {
+      try { memory.notice(e); } catch (err) { logger.error('[呱瓜成员] 处理群成员变动失败:', err); }
+      return false;
+    }
     // 不 await：accept 在每个插件分发前调用，阻塞会拖慢整条消息链路；
     // companionMonitor 内部自行捕获异常
     this.companionMonitor(e).catch(err => logger.error(`[DeepSeek-陪伴] 监听异常:`, err));
@@ -1226,7 +1213,7 @@ export class DeepSeek extends plugin {
     const counts = new Map();
     for (const op of operations) counts.set(op.action, (counts.get(op.action) || 0) + 1);
     const summary = [...counts].map(([action, n]) => `已${action} ${n} 条`).join('，') || '本次未修改记忆';
-    const details = records.slice(0, 8).map(r => `${r.id}：${r.content.slice(0, 65)}${r.subjectId && ['confirmed', 'active'].includes(r.status) ? ` → ${loadProfile().users[r.subjectId]?.name || memory.store.data.members[r.subjectId]?.name || r.subjectId}（${r.subjectId}）` : ''}`);
+    const details = records.slice(0, 8).map(r => `${r.id}：${r.content.slice(0, 65)}${r.subjectId && ['confirmed', 'active'].includes(r.status) ? ` → ${loadProfile().users[r.subjectId]?.name || memory.store.data.people[r.subjectId]?.name || r.subjectId}（${r.subjectId}）` : ''}`);
     return e.reply(`${summary}。${details.length ? `\n${details.join('\n')}` : ''}${records.length > 8 ? `\n另 ${records.length - 8} 条已一并处理。` : ''}${skipped.length ? `\n跳过 ${skipped.length} 条缺少成员的记录。可批量填写“${MEMORY_CMD} 确认 1-3 昵称或QQ号”，不需要的可用“${MEMORY_CMD} 忽略旧记录”。` : ''}`);
   }
 
@@ -1527,7 +1514,9 @@ export class DeepSeek extends plugin {
             }
             // 主人判定：框架 isMaster 或资料库 role=master
             const isMaster = e.isMaster === true || getUserByUid(e.user_id)?.role === 'master';
-            const result = executeProfileQuery(args.action, args.target, args.days, e.group_id, isMaster);
+            // 成员范围：优先复用本轮 chat 已解析的授权 context，缺失时现取一次
+            const qContext = token?.queryContext || await profileQueryContext(e);
+            const result = executeProfileQuery(args.action, args.target, args.days, e.group_id, isMaster, qContext);
             messages.push({
               role: 'tool',
               tool_call_id: toolCall.id,

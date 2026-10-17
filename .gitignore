@@ -28,3 +28,7 @@ member-profile.json.bak
 memory.json
 memory.json.bak
 memory-config.json
+
+# 群成员表缓存（含真实群成员名单，请勿提交）
+group-members.json
+group-members.json.bak

@@ -1,6 +1,7 @@
 import * as fs from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
+import { GroupRoster } from './guagua-roster.mjs';
 
 const DAY = 86400000;
 const TYPES = new Set(['alias', 'preference', 'fact', 'entity', 'event', 'agreement']);
@@ -11,8 +12,10 @@ const clone = value => JSON.parse(JSON.stringify(value));
 const iso = time => new Date(time).toISOString();
 const digest = value => createHash('sha256').update(String(value)).digest('hex').slice(0, 24);
 const text = (value, length = 600) => String(value ?? '').trim().slice(0, length);
-const recordVersion = r => digest(JSON.stringify([r.type, r.subjectId, r.groupId, r.content, r.status, r.entity, r.replaces, r.expiresAt,
-    ...(r.sessionId ? [r.sessionId] : []), ...(r.shareOnBinding ? ['shareOnBinding'] : [])]));
+const scopeKey = r => JSON.stringify([r.scope?.kind, r.scope?.groupId || '', r.scope?.sessionId || '']);
+// 保留旧列表的版本指纹；存储范围改变后旧列表仍会要求重新查看。
+const recordVersion = r => digest(JSON.stringify([r.type, r.subjectId, r.scope?.kind === 'group' ? r.scope.groupId : '', r.content, r.status, r.entity, r.replaces, r.expiresAt,
+    ...(r.scope?.kind === 'private' ? [r.scope.sessionId] : []), ...(r.scope?.shareWhenBound ? ['shareOnBinding'] : [])]));
 const sendFailed = result => result === false || result === null || Boolean(result?.error) || result?.status === 'failed';
 const legacyOrphan = record => !record.subjectId && !record.source?.speakerId && !record.source?.messageId && !record.source?.quote;
 const reviewKey = e => `${sessionKey(e)}:${normalizeId(e.user_id)}`;
@@ -35,6 +38,7 @@ export const DEFAULT_MEMORY_CONFIG = {
     agreementRetentionDays: 30,
     sessionRetentionDays: 7,
     recallLimit: 12,
+    memberRefreshSeconds: 300,
     reminderEnabled: true,
     reminderIntervalHours: 6,
     reminderInitialDelaySeconds: 60,
@@ -49,7 +53,7 @@ export const MEMORY_RULES = `
 - 【已确认长期记忆】可作为事实使用；【待确认参考】只是未经主人确认的聊天线索，可用来理解语境，必要时用“你之前好像提过……”或向本人求证，绝不能改称为已确认事实。
 - 【近期事件和约定】按原消息的时间理解，时效内无需主人确认；不要把过期事件当作当前安排。记录约定不代表已经设置自动执行或到点提醒。
 - 稳定个人信息绑定userid：同一人在多个群的宠物、生日、长期偏好可共用；群内事件、约定、临时偏好、称呼、关系和梗仅在原群或原私聊使用。不可把某群的安排套到另一个群。
-- 跨群稳定个人信息只对当前群已知或本轮涉及的成员召回；同名、相同宠物名或相似关键词不能证明是同一个人。遇到冲突优先用人工资料和主人修正后的记忆。
+- 群成员资格优先于人物识别：只查询当前群已核实的成员；提及、@、旧发言或人工群备注不能证明当前在群。同名、相同宠物名或相似关键词不能证明是同一个人。查询未返回的人物不要自行补出资料。遇到冲突优先用人工资料和主人修正后的记忆。
 - 只在与当前话题相关时自然使用记忆，不要在闲聊中主动罗列他人的资料。`;
 
 export function parseJsonObject(content) {
@@ -65,40 +69,65 @@ function readJson(file) {
 }
 
 function validData(data) {
-    return data?.version === 2 && Number.isInteger(data.nextId) && data.nextId > 0 &&
-        Array.isArray(data.records) && data.records.every(r => r && typeof r.id === 'string' && TYPES.has(r.type) && typeof r.content === 'string') &&
+    return data?.version === 3 && Number.isInteger(data.nextId) && data.nextId > 0 &&
+        Array.isArray(data.records) && data.records.every(r => r && typeof r.id === 'string' && TYPES.has(r.type) && typeof r.content === 'string' &&
+            validScope(r.scope) && !('groupId' in r) && !('sessionId' in r) && !('shareOnBinding' in r)) &&
         data.sessions && !Array.isArray(data.sessions) && typeof data.sessions === 'object' &&
-        Array.isArray(data.observations) && data.members && typeof data.members === 'object' &&
+        Array.isArray(data.observations) && data.people && !Array.isArray(data.people) && typeof data.people === 'object' &&
         data.reminders && typeof data.reminders === 'object' &&
         (data.reviews == null || (typeof data.reviews === 'object' && !Array.isArray(data.reviews)));
 }
 
 function freshData() {
-    return { version: 2, nextId: 1, records: [], members: {}, sessions: {}, observations: [], reminders: {}, reviews: {}, migratedProfile: false, updatedAt: '' };
+    return { version: 3, nextId: 1, records: [], people: {}, sessions: {}, observations: [], reminders: {}, reviews: {}, migratedProfile: false, updatedAt: '' };
 }
 
 function emptySession(now) {
     return { history: [], summary: '', pendingSummary: [], summaryRetryAt: 0, companion: null, updatedAt: now };
 }
 
-// 兼容旧版误存为全局的事件/称呼；依据原始来源修复，不猜测来源不明的记录。
-function normalizeScopes(data) {
-    for (const record of data.records) {
-        const contextual = CONTEXTUAL.has(record.type) || !record.subjectId;
-        if (!contextual) continue;
-        if (record.source?.groupId) record.groupId = normalizeId(record.source.groupId);
-        if (record.groupId) { delete record.sessionId; continue; }
-        const session = String(record.source?.session || '') || String(record.source?.messageId || '').match(/^([^:]+:private:[^:]+):/)?.[1];
-        if (session?.includes(':private:')) record.sessionId ||= session;
+function validScope(scope) {
+    return scope && ['person', 'group', 'private', 'unresolved'].includes(scope.kind) &&
+        (scope.kind !== 'group' || (typeof scope.groupId === 'string' && Boolean(scope.groupId))) &&
+        (scope.kind !== 'private' || (typeof scope.sessionId === 'string' && /^[^:]+:private:[^:]+$/.test(scope.sessionId)));
+}
+
+function canonicalRecord(input) {
+    const record = { ...input };
+    if (!record.scope) {
+        const local = CONTEXTUAL.has(record.type) || !record.subjectId;
+        const groupId = normalizeId((local && record.source?.groupId) || record.groupId);
+        const session = String(record.sessionId || (local && (record.source?.session || String(record.source?.messageId || '').match(/^([^:]+:private:[^:]+):/)?.[1])) || '');
+        record.scope = groupId ? { kind: 'group', groupId } : session?.includes(':private:') ? { kind: 'private', sessionId: session } :
+            record.subjectId && !TEMPORARY.has(record.type) ? { kind: 'person' } : { kind: 'unresolved' };
+        if (record.shareOnBinding) record.scope.shareWhenBound = true;
     }
+    delete record.groupId;
+    delete record.sessionId;
+    delete record.shareOnBinding;
+    return record;
+}
+
+function upgradeData(input) {
+    if (input?.version !== 2) return input;
+    if (!Array.isArray(input.records) || !input.members || typeof input.members !== 'object') throw Error('旧版记忆结构不完整');
+    const data = { ...input, version: 3, records: input.records.map(canonicalRecord), people: {} };
+    for (const [uid, person] of Object.entries(input.members)) {
+        data.people[uid] = { ...person };
+        if (person.groups) data.people[uid].namesByGroup = person.groups;
+        delete data.people[uid].groups;
+    }
+    delete data.members;
+    return data;
 }
 
 export class MemoryStore {
-    constructor(directory, { logger = console, now = Date.now } = {}) {
+    constructor(directory, { logger = console, now = Date.now, authorize = () => [] } = {}) {
         this.file = path.join(directory, 'memory.json');
         this.configFile = path.join(directory, 'memory-config.json');
         this.logger = logger;
         this.now = now;
+        this.authorize = authorize;
         this.data = freshData();
         this.blocked = '';
         this.stamp = '';
@@ -115,9 +144,8 @@ export class MemoryStore {
     load() {
         try {
             if (fs.existsSync(this.file)) {
-                const data = readJson(this.file);
+                const data = upgradeData(readJson(this.file));
                 if (!validData(data)) throw new Error('memory.json 结构不完整或版本不兼容');
-                normalizeScopes(data);
                 this.data = data;
             }
             this.blocked = '';
@@ -137,7 +165,7 @@ export class MemoryStore {
             for (const [key, min, max] of [
                 ['extractionBatchSize', 1, 50], ['extractionDelaySeconds', 0, 3600],
                 ['eventRetentionDays', 1, 365], ['agreementRetentionDays', 1, 365],
-                ['sessionRetentionDays', 1, 90], ['recallLimit', 1, 40],
+                ['sessionRetentionDays', 1, 90], ['recallLimit', 1, 40], ['memberRefreshSeconds', 30, 3600],
                 ['reminderIntervalHours', 1, 168], ['reminderInitialDelaySeconds', 0, 3600], ['reminderPageSize', 1, 8]
             ]) {
                 const n = Number(config[key]);
@@ -165,7 +193,6 @@ export class MemoryStore {
         if (this.blocked) throw new Error(`记忆文件读取失败，未写入：${this.blocked}`);
         const next = clone(this.data);
         const result = update(next);
-        normalizeScopes(next);
         next.updatedAt = iso(this.now());
         this.write(next);
         this.data = next;
@@ -185,7 +212,7 @@ export class MemoryStore {
         if (this.data.migratedProfile) return;
         this.change(data => {
             for (const [uid, user] of Object.entries(profile.users || {})) {
-                data.members[uid] = { name: user.name || uid };
+                data.people[uid] ||= { name: user.name || uid };
                 for (const learned of user.learned || []) {
                     this.addTo(data, { type: 'alias', subjectId: uid, content: learned.alias, status: 'confirmed',
                         source: { speakerId: uid, at: learned.at || '', quote: '', context: learned.source || '旧资料迁移' } });
@@ -202,8 +229,9 @@ export class MemoryStore {
     }
 
     addTo(data, record) {
+        record = canonicalRecord(record);
         const existing = data.records.find(r => r.type === record.type && r.subjectId === record.subjectId &&
-            (r.groupId || '') === (record.groupId || '') && (r.sessionId || '') === (record.sessionId || '') && r.content === record.content);
+            scopeKey(r) === scopeKey(record) && r.content === record.content);
         if (existing) {
             if (['ignored', 'superseded', 'deleted'].includes(existing.status)) return existing;
             existing.lastSeenAt = iso(this.now());
@@ -215,7 +243,7 @@ export class MemoryStore {
             }
             return existing;
         }
-        const next = { id: `M${String(data.nextId++).padStart(6, '0')}`, subjectId: '', groupId: '',
+        const next = { id: `M${String(data.nextId++).padStart(6, '0')}`, subjectId: '',
             ...record, createdAt: iso(this.now()), updatedAt: iso(this.now()), lastSeenAt: iso(this.now()) };
         data.records.push(next);
         return next;
@@ -228,10 +256,9 @@ export class MemoryStore {
     pending() { return this.data.records.filter(r => r.status === 'pending' && this.usable(r)); }
 
     inScope(record, groupId = '', sessionId = '') {
-        if (record.groupId) return normalizeId(record.groupId) === normalizeId(groupId);
-        if (record.sessionId) return record.sessionId === sessionId;
-        // 缺失原始会话的旧事件不再当作全局安排；旧人工/迁移称呼保持兼容。
-        return !TEMPORARY.has(record.type);
+        if (record.scope.kind === 'group') return record.scope.groupId === normalizeId(groupId);
+        if (record.scope.kind === 'private') return !groupId && record.scope.sessionId === sessionId;
+        return record.scope.kind === 'person' && Boolean(record.subjectId) && !TEMPORARY.has(record.type);
     }
 
     aliases(uid, groupId, sessionId = '') {
@@ -239,16 +266,17 @@ export class MemoryStore {
             this.usable(r) && this.inScope(r, groupId, sessionId)).map(r => r.content);
     }
 
-    search({ userIds = [], groupId = '', sessionId = '', allowedUserIds, subjectIds, query = '', limit = this.config.recallLimit } = {}) {
+    search(options = {}) {
+        const { userIds = [], groupId = '', sessionId = '', subjectIds, query = '', limit = this.config.recallLimit } = options;
         const ids = new Set(userIds.map(normalizeId));
-        const allowed = allowedUserIds == null ? null : new Set(allowedUserIds.map(normalizeId));
+        const allowed = groupId ? new Set(this.authorize({ ...options, groupId: normalizeId(groupId) })) : null;
         const subjects = subjectIds == null ? null : new Set(subjectIds.map(normalizeId));
         const q = text(query, 2000).toLowerCase();
         const words = [...new Set(q.match(/[a-z0-9]{2,}|[\u3400-\u9fff]{2,}/g) || [])];
         const grams = words.flatMap(w => w.length > 3 ? Array.from({ length: w.length - 1 }, (_, i) => w.slice(i, i + 2)) : [w]);
         return this.data.records.filter(r => this.usable(r) && this.inScope(r, groupId, sessionId) &&
             (!subjects || subjects.has(r.subjectId)) &&
-            (r.groupId || r.sessionId || (r.subjectId && (!allowed || allowed.has(r.subjectId)))))
+            (!allowed || allowed.has(r.subjectId || r.source?.speakerId)))
             .map(r => {
                 const body = `${r.content} ${r.entity?.name || ''} ${r.entity?.relation || ''}`.toLowerCase();
                 const matches = grams.reduce((n, w) => n + Number(body.includes(w)), 0);
@@ -267,7 +295,7 @@ export class MemoryStore {
         ];
         return groups.map(([status, heading]) => {
             const lines = records.filter(r => r.status === status).map(r =>
-                `- ${r.id} userid=${r.subjectId || '对象未确定'}；${LABELS[r.type]}：${r.content}${r.groupId ? '（仅本群）' : r.sessionId ? '（仅本次私聊）' : '（个人稳定信息）'}；来源时间:${r.source?.at || r.createdAt}${r.expiresAt ? `；有效至:${r.expiresAt}` : ''}`);
+                `- ${r.id} userid=${r.subjectId || '对象未确定'}；${LABELS[r.type]}：${r.content}${r.scope.kind === 'group' ? '（仅本群）' : r.scope.kind === 'private' ? '（仅本次私聊）' : '（个人稳定信息）'}；来源时间:${r.source?.at || r.createdAt}${r.expiresAt ? `；有效至:${r.expiresAt}` : ''}`);
             return lines.length ? `${heading}\n${lines.join('\n')}` : '';
         }).filter(Boolean).join('\n').slice(0, 6500);
     }
@@ -288,15 +316,12 @@ export class MemoryStore {
                     if (['ignored', 'deleted', 'superseded'].includes(record.status)) throw new Error('这条记录已被忽略、删除或更正');
                     if (arg) record.subjectId = normalizeId(arg);
                     if (!record.subjectId) throw new Error(`${record.id} 缺少对应成员，请填写“#memory 确认 ${record.id} 昵称或QQ号”；本批次未作修改`);
-                    if (record.shareOnBinding && !CONTEXTUAL.has(record.type)) {
-                        record.groupId = '';
-                        delete record.sessionId;
-                        delete record.shareOnBinding;
-                    }
+                    if (record.scope.shareWhenBound && !CONTEXTUAL.has(record.type)) record.scope = { kind: 'person' };
+                    else if (record.scope.kind === 'unresolved' && !TEMPORARY.has(record.type)) record.scope = { kind: 'person' };
                     record.status = TEMPORARY.has(record.type) ? 'active' : 'confirmed';
                     if (record.replaces) {
                         const old = data.records.find(r => r.id === record.replaces && r.subjectId === record.subjectId && r.type === record.type &&
-                            (r.groupId || '') === (record.groupId || '') && (r.sessionId || '') === (record.sessionId || ''));
+                            scopeKey(r) === scopeKey(record));
                         if (old) old.status = 'superseded';
                     }
                 } else if (action === '修正') {
@@ -363,7 +388,8 @@ export class MemoryStore {
 
 export class MemoryService {
     constructor({ directory, complete, getProfile, logger = console, now = Date.now }) {
-        this.store = new MemoryStore(directory, { logger, now });
+        this.roster = new GroupRoster({ directory, logger, now, config: () => this.store?.config || {}, onRevoke: e => this.invalidate(e) });
+        this.store = new MemoryStore(directory, { logger, now, authorize: options => this.roster.authorizedIds(options.groupId, options) });
         this.complete = complete;
         this.getProfile = getProfile;
         this.logger = logger;
@@ -388,7 +414,7 @@ export class MemoryService {
         return this.profileCache || { users: {}, pending: [] };
     }
     start() { this.timer = setInterval(() => { this.tick().catch(e => this.logger.error('[呱瓜记忆]', e.message)); }, 15000); this.timer.unref?.(); }
-    dispose() { this.active = false; clearInterval(this.timer); }
+    dispose() { this.active = false; clearInterval(this.timer); this.roster.flush(); }
     token(e) { const key = sessionKey(e); return { key, epoch: this.epochs.get(key) || 0 }; }
     current(token) { return this.active && (this.epochs.get(token.key) || 0) === token.epoch; }
     invalidate(e) { const key = sessionKey(e); this.epochs.set(key, (this.epochs.get(key) || 0) + 1); }
@@ -396,43 +422,44 @@ export class MemoryService {
     registerBot(bot) { if (bot) this.bots.set(normalizeId(bot.uin || bot.self_id || 'default'), bot); }
 
     identityIds() {
-        return [...new Set([...Object.keys(this.profile().users || {}), ...Object.keys(this.store.data.members),
+        return [...new Set([...Object.keys(this.profile().users || {}), ...Object.keys(this.store.data.people),
             ...this.store.data.records.map(r => r.subjectId).filter(Boolean)])];
     }
 
-    memberIds(groupId, userIds = [], currentMemberIds) {
-        const ids = new Set(userIds.map(normalizeId).filter(Boolean));
-        if (Array.isArray(currentMemberIds)) {
-            for (const uid of currentMemberIds) ids.add(normalizeId(uid));
-        } else if (groupId) {
-            const gid = normalizeId(groupId);
-            for (const [uid, user] of Object.entries(this.profile().users || {})) if (user.groups?.[gid]) ids.add(uid);
-            for (const [uid, member] of Object.entries(this.store.data.members)) if (member.groups?.[gid]) ids.add(uid);
-            for (const source of [...this.store.data.observations, ...this.store.data.records.map(r => r.source)]) {
-                if (source && normalizeId(source.groupId) === gid && source.speakerId) ids.add(normalizeId(source.speakerId));
-            }
-        }
-        return [...ids].filter(Boolean);
+    memberIds(groupId, context = {}) { return this.roster.authorizedIds(groupId, context); }
+
+    async queryContext(e, userIds = []) {
+        this.registerBot(e.bot);
+        await this.roster.ensure(e);
+        return this.roster.context(e, [e.user_id, ...userIds]);
+    }
+
+    notice(e) {
+        if (!this.roster.handleNotice(e)) return false;
+        this.registerBot(e.bot);
+        this.invalidate(e);
+        return true;
     }
 
     memberName(uid, groupId) {
-        const key = normalizeId(uid), user = this.profile().users?.[key], observed = this.store.data.members[key];
+        const key = normalizeId(uid), user = this.profile().users?.[key], observed = this.store.data.people[key];
         // 旧版 name 可能是另一群最后出现的名片，无法恢复其所属群时不拿它认人。
-        return user?.groups?.[normalizeId(groupId)]?.name || observed?.groups?.[normalizeId(groupId)]?.name ||
+        return user?.groups?.[normalizeId(groupId)]?.name || observed?.namesByGroup?.[normalizeId(groupId)]?.name ||
             user?.name || observed?.nickname || (!observed?.lastSeenAt && observed?.name) || key;
     }
 
     names(uid, groupId, sessionId = '') {
-        const key = normalizeId(uid), user = this.profile().users?.[key], observed = this.store.data.members[key];
+        const key = normalizeId(uid), user = this.profile().users?.[key], observed = this.store.data.people[key];
         return [...new Set([user?.name, ...(user?.aliases || []), ...(user?.learned || []).map(l => l.alias),
             observed?.nickname, !observed?.lastSeenAt && observed?.name, user?.groups?.[normalizeId(groupId)]?.name,
-            observed?.groups?.[normalizeId(groupId)]?.name, ...this.store.aliases(key, groupId, sessionId)].filter(Boolean))];
+            observed?.namesByGroup?.[normalizeId(groupId)]?.name, ...this.store.aliases(key, groupId, sessionId)].filter(Boolean))];
     }
 
     recallOptions(options = {}) {
         const query = text(options.query, 3000);
         const ids = new Set((options.userIds || []).map(normalizeId));
-        const visible = options.groupId ? new Set(this.memberIds(options.groupId, [...ids], options.memberIds)) : null;
+        const visible = options.groupId ? new Set(this.memberIds(options.groupId, options)) : null;
+        if (visible) for (const uid of ids) if (!visible.has(uid)) ids.delete(uid);
         const identities = new Map();
         for (const uid of this.identityIds()) {
             if (visible && !visible.has(uid)) continue;
@@ -443,7 +470,7 @@ export class MemoryService {
             }
         }
         for (const matches of identities.values()) if (matches.size === 1) ids.add([...matches][0]);
-        return { ...options, userIds: [...ids], ...(visible ? { allowedUserIds: [...visible] } : {}) };
+        return { ...options, userIds: [...ids] };
     }
 
     context(options = {}) { return this.store.context(this.recallOptions(options)); }
@@ -472,15 +499,16 @@ export class MemoryService {
 
     observe(e, content, immediate = false) {
         this.registerBot(e.bot);
+        this.roster.noteMessage(e);
         if (!this.store.config.enabled || !content?.trim()) return;
         const source = this.source(e, content);
         this.safe(() => this.store.change(data => {
-            const member = data.members[source.speakerId] ||= {};
+            const member = data.people[source.speakerId] ||= {};
             if (source.nickname) { member.nickname = source.nickname; member.name = source.nickname; }
             member.lastSeenAt = source.at;
             if (source.groupId) {
-                member.groups ||= {};
-                member.groups[source.groupId] = { ...member.groups[source.groupId], name: source.name, lastSeenAt: source.at };
+                member.namesByGroup ||= {};
+                member.namesByGroup[source.groupId] = { ...member.namesByGroup[source.groupId], name: source.name, lastSeenAt: source.at };
             }
             if (!data.observations.some(o => o.id === source.id)) data.observations.push({ ...source, readyAt: this.now() + (immediate ? 0 : this.store.config.extractionDelaySeconds * 1000), attempts: 0 });
             if (data.observations.filter(o => o.session === source.session && !o.attempts).length >= this.store.config.extractionBatchSize) {
@@ -509,7 +537,6 @@ export class MemoryService {
 
     ingest(records, sources) {
         if (!Array.isArray(records)) throw new Error('提取结果 memories 必须是数组');
-        const allowed = new Set([...sources.map(s => s.speakerId), ...sources.flatMap(s => s.targets || []), ...Object.keys(this.profile().users || {}), ...Object.keys(this.store.data.members)]);
         return this.store.change(data => {
             let added = 0;
             for (const raw of records.slice(0, 40)) {
@@ -518,7 +545,9 @@ export class MemoryService {
                 const source = sources.find(s => s.id === raw.source_id && evidence && s.text.includes(evidence));
                 if (!source) continue;
                 const subjectId = normalizeId(raw.userid);
-                if (subjectId && !allowed.has(subjectId)) continue;
+                // 历史原文可记录说话人自身；第三方必须属于该消息的当前群，@及全局建档不能授权。
+                const currentMembers = source.groupId ? this.roster.ids(source.botId || source.session?.split(':')[0] || 'default', source.groupId) : [];
+                if (subjectId && subjectId !== source.speakerId && !currentMembers.includes(subjectId)) continue;
                 if (TEMPORARY.has(raw.type) && !subjectId) continue;
                 const temporary = TEMPORARY.has(raw.type);
                 // 稳定信息必须明确选择 global 且有对应人；事件、约定和自动称呼始终保留会话范围。
@@ -532,9 +561,10 @@ export class MemoryService {
                     expiresAt = iso(Number.isFinite(explicit) ? explicit : Date.parse(source.at) + retention * DAY);
                 }
                 const record = {
-                    type: raw.type, subjectId, groupId: global ? '' : normalizeId(source.groupId),
-                    ...(!global && !source.groupId && source.session ? { sessionId: source.session } : {}),
-                    ...(raw.scope === 'global' && !CONTEXTUAL.has(raw.type) && !subjectId ? { shareOnBinding: true } : {}),
+                    type: raw.type, subjectId,
+                    scope: { ...(global ? { kind: 'person' } : source.groupId ? { kind: 'group', groupId: normalizeId(source.groupId) } :
+                        source.session?.includes(':private:') ? { kind: 'private', sessionId: source.session } : { kind: 'unresolved' }),
+                        ...(raw.scope === 'global' && !CONTEXTUAL.has(raw.type) && !subjectId ? { shareWhenBound: true } : {}) },
                     content: text(raw.content, raw.type === 'alias' ? 40 : 600), status: temporary ? (Date.parse(expiresAt) > now ? 'active' : 'expired') : 'pending',
                     source: { speakerId: source.speakerId, messageId: source.id, groupId: source.groupId, session: source.session, at: source.at, quote: evidence },
                     ...(expiresAt ? { expiresAt } : {})
@@ -560,8 +590,11 @@ export class MemoryService {
         const ids = new Set(batch.map(s => s.id));
         this.extracting = true;
         try {
-            const existing = this.store.search(this.recallOptions({ userIds: batch.flatMap(s => [s.speakerId, ...(s.targets || [])]),
-                groupId: first.groupId, sessionId: first.session, query: batch.map(s => s.text).join(' '), limit: 16 }));
+            const e = { self_id: first.botId || first.session?.split(':')[0] || 'default', group_id: first.groupId, user_id: first.speakerId };
+            e.bot = this.bots.get(normalizeId(e.self_id));
+            await this.roster.ensure(e);
+            const context = this.roster.context(e, batch.flatMap(s => [s.speakerId, ...(s.targets || [])]));
+            const existing = this.store.search(this.recallOptions({ ...context, query: batch.map(s => s.text).join(' '), limit: 16 }));
             const result = await this.complete({
                 model: this.store.config.extractionModel || undefined,
                 messages: [{ role: 'system', content: `你是群聊记忆提取器。只提取消息明确出现、以后有用的信息，返回一个JSON对象，不要输出其他内容。
@@ -752,12 +785,12 @@ userid必须准确对应人物，“我/我的宠物”归发言人；对方说�
     }
 
     display(record) {
-        const name = record.subjectId ? this.memberName(record.subjectId, record.source?.groupId || record.groupId) : '对应成员待识别';
+        const name = record.subjectId ? this.memberName(record.subjectId, record.source?.groupId || record.scope.groupId) : '对应成员待识别';
         if (legacyOrphan(record)) return `${record.id}｜旧${LABELS[record.type]}待归属\n${record.content}\n记录日期：${record.source?.at || record.createdAt}`;
         const speaker = record.source?.speakerId;
-        const speakerName = speaker && this.memberName(speaker, record.source?.groupId || record.groupId);
+        const speakerName = speaker && this.memberName(speaker, record.source?.groupId || record.scope.groupId);
         const state = { confirmed: '已确认', pending: '待确认参考', active: '时效内免确认' }[record.status] || record.status;
-        return `${record.id}｜${LABELS[record.type]}｜${name}${record.subjectId ? `（${record.subjectId}）` : ''}\n[${state}] ${record.content}${record.groupId ? `\n范围：群 ${record.groupId}` : record.sessionId ? '\n范围：原私聊会话' : TEMPORARY.has(record.type) ? '\n范围：原会话缺失，暂停自动召回' : record.subjectId ? '\n范围：跨群个人信息' : '\n对应成员尚待识别，不能归到说话人名下'}\n来源：${record.source?.at || record.createdAt}${record.source?.groupId ? `，群 ${record.source.groupId}` : ''}${speaker ? `\n说话人：${speakerName}（${speaker}）` : ''}${record.source?.quote ? `\n原话：${text(record.source.quote, 180)}` : ''}${record.expiresAt ? `\n有效至：${record.expiresAt}` : ''}`;
+        return `${record.id}｜${LABELS[record.type]}｜${name}${record.subjectId ? `（${record.subjectId}）` : ''}\n[${state}] ${record.content}${record.scope.kind === 'group' ? `\n范围：群 ${record.scope.groupId}` : record.scope.kind === 'private' ? '\n范围：原私聊会话' : record.scope.kind === 'unresolved' ? '\n范围：对象或原会话缺失，暂停自动召回' : '\n范围：个人信息（仅本人所在群可用）'}\n来源：${record.source?.at || record.createdAt}${record.source?.groupId ? `，群 ${record.source.groupId}` : ''}${speaker ? `\n说话人：${speakerName}（${speaker}）` : ''}${record.source?.quote ? `\n原话：${text(record.source.quote, 180)}` : ''}${record.expiresAt ? `\n有效至：${record.expiresAt}` : ''}`;
     }
 
     pages(records, title, commands = true) {
@@ -830,6 +863,7 @@ userid必须准确对应人物，“我/我的宠物”归发言人；对方说�
         this.ticking = true;
         try {
             this.store.readConfig();
+            await this.roster.tick();
             if (!this.store.data.migratedProfile) this.safe(() => { this.profileCache = this.getProfile(); this.store.migrate(this.profileCache); });
             this.safe(() => this.store.cleanup());
             await this.notifyPending();
