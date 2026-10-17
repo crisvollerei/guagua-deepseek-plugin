@@ -211,8 +211,8 @@ function buildUserContext(userIds, groupId, context = {}) {
 // 成员范围统一交给记忆服务的 GroupRoster：维护本群成员表（必要时向适配器补取）并签发授权 context。
 // 返回的 context 必须原样传给 memory.memberIds / memory.context —— 其中的 groupAccess 授权令牌
 // 与 bot/群号绑定，拆开传参会导致授权失败、可见成员恒为空。
-async function profileQueryContext(e) {
-  return memory.queryContext(e);
+async function profileQueryContext(e, userIds = []) {
+  return memory.queryContext(e, userIds);
 }
 
 // 解析回复末尾的学习元数据行：【MEM】{json}
@@ -962,11 +962,8 @@ export class DeepSeek extends plugin {
   // accept 在规则匹配之前对所有插件依次调用，返回 false 不会阻止其他插件处理。
   async accept(e) {
     memory.registerBot(e.bot);
-    // 入群/退群通知：维护本群成员表（授权范围随之刷新），不进入聊天流程
-    if (e.post_type === 'notice') {
-      try { memory.notice(e); } catch (err) { logger.error('[呱瓜成员] 处理群成员变动失败:', err); }
-      return false;
-    }
+    // 真实发言即成员在场见证：供群成员表判断本群有哪些成员
+    memory.roster.noteMessage(e);
     // 不 await：accept 在每个插件分发前调用，阻塞会拖慢整条消息链路；
     // companionMonitor 内部自行捕获异常
     this.companionMonitor(e).catch(err => logger.error(`[DeepSeek-陪伴] 监听异常:`, err));
@@ -1292,6 +1289,7 @@ export class DeepSeek extends plugin {
   // 并用 token 标记会话世代，重置/关闭后旧的在途请求自动作废
   async chat(e) {
     memory.registerBot(e.bot);
+    memory.roster.noteMessage(e);
     return memory.runSession(e, token => this.chatUnlocked(e, token));
   }
 
@@ -1514,9 +1512,9 @@ export class DeepSeek extends plugin {
             }
             // 主人判定：框架 isMaster 或资料库 role=master
             const isMaster = e.isMaster === true || getUserByUid(e.user_id)?.role === 'master';
-            // 成员范围：优先复用本轮 chat 已解析的授权 context，缺失时现取一次
-            const qContext = token?.queryContext || await profileQueryContext(e);
-            const result = executeProfileQuery(args.action, args.target, args.days, e.group_id, isMaster, qContext);
+            // 成员范围：按本轮涉及的用户重新取得授权 context（成员表可能已刷新）
+            const queryContext = await profileQueryContext(e, token.queryContext?.userIds);
+            const result = executeProfileQuery(args.action, args.target, args.days, e.group_id, isMaster, queryContext);
             messages.push({
               role: 'tool',
               tool_call_id: toolCall.id,
@@ -2092,6 +2090,8 @@ ${bufLines}
       if (needQuery) {
         // 插件代查资料/日期，把程序算好的结果交给 AI 引用（不依赖模型心算/编造）
         const isMaster = e.isMaster === true || getUserByUid(e.user_id)?.role === 'master';
+        // 把判断期间新到消息涉及的成员也纳入范围后重新授权
+        const queryContext = await profileQueryContext(e, [...involvedUsers, ...newMsgs.map(m => m.userId), ...newMsgs.flatMap(m => m.source?.targets || [])]);
         const qResult = executeProfileQuery(needQuery.action, needQuery.target, needQuery.days, gid, isMaster, queryContext);
         extra.push(`资料查询结果（以结果为准，不要自行推算或编造）：${qResult}`);
       }
@@ -2149,5 +2149,30 @@ ${bufLines}
     ], maxLength));
     memory.safe(() => memory.store.companion(historyKey, state));
     logger.info(`[DeepSeek-陪伴] 主动回复: ${replyText}`);
+  }
+}
+
+// 独立的入群/退群通知接收插件：
+// 主插件 event 为 'message'，收不到 notice 事件，因此需要单独一个 event: 'notice' 的插件类；
+// 收到通知时刷新本群成员表，并把已退群成员从陪伴缓冲中剔除，避免对着已离开的人说话。
+export class GuaguaGroupNotice extends plugin {
+  constructor() {
+    super({ name: `${CMD.noticePluginName || 'guagua-group-members'}`, dsc: '呱瓜群成员同步', event: 'notice', priority: -2000, rule: [] });
+  }
+
+  async accept(e) {
+    try {
+      if (!memory.notice(e)) return false;
+      const state = companionState.get(normalizeId(e.group_id));
+      if (state && state.sessionKey === sessionKey(e)) {
+        clearTimeout(state.retryTimer);
+        const present = memory.roster.ids(normalizeId(e.self_id || e.bot?.uin || 'default'), e.group_id);
+        state.buffer = state.buffer.filter(item => present.includes(normalizeId(item.userId)));
+        memory.safe(() => memory.store.companion(state.sessionKey, state));
+      }
+    } catch (err) {
+      logger.error('[呱瓜成员] 处理群成员变动失败:', err);
+    }
+    return false;
   }
 }
