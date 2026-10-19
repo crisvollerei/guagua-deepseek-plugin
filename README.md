@@ -12,6 +12,7 @@ guagua-deepseek-plugin/
 ├── config.js                   # 配置文件（密钥、模型、命令前缀、人设、陪伴与记忆参数）
 ├── guagua-memory.mjs           # 长期记忆模块（后台提取 / 确认 / 召回 / 摘要）
 ├── guagua-roster.mjs           # 群成员表模块（成员范围授权 / 入退群跟踪 / 名单缓存）
+├── guagua-web.mjs              # 网页搜索与抓取模块（官方接口 / Ollama 兼容 / 限额与错误归一）
 ├── member-profile.example.json # 用户资料库模板（复制为 member-profile.json 后填写）
 ├── 记忆功能使用说明.md          # 长期记忆功能详解（行为、命令、参数、数据文件）
 ├── package.json                # 依赖声明（openai、axios）
@@ -56,7 +57,9 @@ group-members.json    # 本群成员名单缓存（自动维护）
 |---|---|
 | `deepseek.baseURL` / `deepseek.apiKey` | DeepSeek 接口地址与密钥（**必须替换**） |
 | `deepseek.defaultModel` / `models` | 默认模型与 `#ds切换模型` 的模型映射（默认 `deepseek-flash` / `deepseek-v4-pro`，使用第三方网关时请改为网关支持的模型名） |
-| `webSearch.apiKey` / `apiUrl` / `enabled` | 联网搜索（Ollama Web Search Cloud API）密钥、地址与开关（**密钥必须替换**） |
+| `webSearch.provider` | 联网服务：`deepseek`（默认，复用 `deepseek.apiKey`）或 `ollama` |
+| `webSearch.apiKey` / `ollamaSearchUrl` / `ollamaFetchUrl` | Ollama 兼容服务的密钥与地址（选用 ollama 时填写） |
+| `webSearch.enabled` | 是否向模型暴露网页工具 |
 | `command.chatPrefix` / `reset` / `companion` / `adminPrefix` | 各命令触发前缀（需以 `#` 开头） |
 | `chat.*` | 对话默认参数（上下文长度 / 群聊记录长度 / 温度 / 思考过程显示 / 多模态图片上限与超时 / 单条消息截断长度），运行时被 redis 中已保存的配置覆盖 |
 | `profile.*` | 用户资料库：文件名、内存缓存时长、学习称呼长度上限 |
@@ -78,11 +81,15 @@ group-members.json    # 本群成员名单缓存（自动维护）
    - `deepseek-v4-pro`：深度思考模型（`#ds切换模型 pro` 切换）
    - 历史命名 `deepseek-chat` / `deepseek-reasoner` 官方仍保持兼容
 
-### 第 2 步：获取 Ollama Web Search Key（可选，用于联网搜索）
+### 第 2 步：联网服务（可选）
+
+默认使用 **DeepSeek 官方搜索/抓取接口**，复用第 1 步的 `deepseek.apiKey`，**无需额外配置**。
+
+如需改用 Ollama 兼容服务：
 
 1. 打开 Ollama：<https://ollama.com>，登录后进入 Cloud / API 设置
 2. 生成 API Key（形如 `uuid.token`）
-3. 如果不需要联网搜索功能，可将 `config.webSearch.enabled` 改为 `false`，跳过本步
+3. 不需要联网功能时，可将 `config.webSearch.enabled` 改为 `false`，跳过本步
 
 ### 第 3 步：填入配置（直接编辑 `config.js`）
 
@@ -93,7 +100,8 @@ deepseek: {
   apiKey: 'sk-你的DeepSeek密钥',      // 必填
 },
 webSearch: {
-  apiKey: '你的Ollama密钥',           // 启用联网搜索时必填
+  provider: 'deepseek',              // deepseek（默认）或 ollama
+  apiKey: '你的Ollama密钥',           // 仅 provider 为 ollama 时必填
   enabled: true,
 },
 persona: {
@@ -214,6 +222,7 @@ npm install openai axios   # 在 trss-yunzai 项目根目录执行
 | `#ds设置群聊记录长度 <数字>` | 设置群聊历史条数（0-20） | master |
 | `#ds设置提示词 <内容>` | 设置自定义系统提示词（存 redis，优先于 config 默认人设） | master |
 | `#ds设置思考过程 <关闭\|开启\|转发>` | 设置思考过程显示方式 | master |
+| `#ds搜索服务 [deepseek\|ollama]` | 查看或切换搜索与抓取服务（默认 deepseek） | master |
 
 ## 多模态（图片理解）
 
@@ -280,7 +289,8 @@ npm install openai axios   # 在 trss-yunzai 项目根目录执行
 ## 常见问题
 
 - **对话无响应**：检查 `config.js` 中 `deepseek.apiKey` 是否已填写、`openai`/`axios` 是否安装
-- **联网搜索不可用**：检查 `webSearch.apiKey` 是否已填写、`enabled` 是否为 `true`
+- **联网搜索不可用**：检查 `webSearch.enabled` 是否为 `true`；选用 `ollama` 时确认 `webSearch.apiKey` 已填写；
+  可用 `#ds搜索服务` 查看当前服务。DeepSeek 官方接口复用 `deepseek.apiKey`
 - **图片没有生效**：确认当前模型支持视觉（`#ds帮助` 查看）；切到 `deepseek-v4-pro` 后图片会自动退回文本占位
 - **AI 不认识某位群友**：在 `member-profile.json` 中补该 userid 的资料，或执行 `#呱瓜资料重载`
 - **资料改动没生效**：资料有 60 秒内存缓存，用 `#呱瓜资料重载` 可立即刷新

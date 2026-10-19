@@ -52,14 +52,20 @@ export const config = {
     maxRetries: 1            // 失败重试次数
   },
 
-  /* ==================== 联网搜索（Ollama Web Search Cloud API） ==================== */
+  /* ==================== 联网搜索与网页抓取 ==================== */
+  // 支持两种服务：
+  //   deepseek —— DeepSeek 官方搜索/抓取接口（默认，复用上面 deepseek.apiKey）
+  //   ollama   —— Ollama Web Search / Fetch（需填写下方 ollamaApiKey）
+  // 运行时可用「#ds搜索服务 deepseek|ollama」切换，切换结果存 redis，优先级高于此处默认值。
   webSearch: {
-    // ！！！请替换为你自己的 Key，切勿泄露！！！
+    provider: 'deepseek',   // 默认服务：deepseek 或 ollama
+
+    enabled: true,          // 是否向模型暴露网页工具（web_search / web_fetch）
+
+    // Ollama 服务凭据（provider 为 ollama 时必填）
     apiKey: process.env.OLLAMA_API_KEY || 'your_ollama_api_key_here',
-    apiUrl: 'https://ollama.com/api/web_search',
-    enabled: true,          // 是否向模型暴露联网搜索工具
-    maxResults: 5,          // 单次搜索返回条数
-    timeout: 15000          // 请求超时（毫秒）
+    ollamaSearchUrl: 'https://ollama.com/api/web_search',
+    ollamaFetchUrl: 'https://ollama.com/api/web_fetch'
   },
 
   /* ==================== 命令与触发词（前缀需以 # 开头） ==================== */
@@ -204,9 +210,9 @@ export const config = {
   - 使用颜文字代替emoji中的黄脸表情，emoji非黄脸表情可以自由使用
 
   ★ 工具使用（重要）：
-  - 你被提供了一个名为 "ollama_web_search" 的网页搜索工具。
-  - 【严格】仅在用户询问【实时新闻】、【今日天气】、【股票价格】、【体育赛事结果】或任何你明确知道自己知识库中没有的【近期时事】时，才可调用此工具。
-  - 对于【日常聊天】、【打招呼】、【角色扮演】、【询问个人看法】，你【禁止】使用搜索工具，应直接根据你的人设和知识库回答。
+  - 联网工具可用时，可用 web_search 核实实时信息、查找资料，用 web_fetch 阅读用户提供或搜索找到的网页。
+  - 搜索摘要用于筛选来源；需要页面细节时继续抓取，再依据实际获得的内容回答。
+  - 日常聊天、打招呼、角色扮演、询问个人看法通常不需要联网。
   - 你被提供了一个名为 "member_profile_query" 的成员资料查询工具（参数见工具定义）：查某用户资料用 user_info（target=昵称/别称/userid）；查"几天后/明天/什么时候是谁生日或日子"用 upcoming_birthdays（days 填天数，默认7）；主人需要全面了解成员时可 full_export。
   - 当用户询问群友的身份/生日/称呼/资料或近期日子时，调用此工具获取准确信息；【禁止】自行推算日期或编造资料，以工具返回结果为准。
   - 在调用工具前，请仔细评估用户的问题是否【必须】通过工具才能准确回答。

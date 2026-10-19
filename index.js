@@ -30,6 +30,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname } from 'node:path';
 import { config } from './config.js';
 import { MemoryService, MEMORY_RULES, sessionKey, normalizeId } from './guagua-memory.mjs';
+import { WebService, WEB_TOOLS, WEB_RULES } from './guagua-web.mjs';
 
 // 框架全局注入 common；缺失时兜底，保证独立加载 / 热重载不因框架差异崩溃
 const common = global.common || {
@@ -250,6 +251,18 @@ const openai = new OpenAI({
   apiKey: config.deepseek.apiKey,
   timeout: config.deepseek.timeout,
   maxRetries: config.deepseek.maxRetries
+});
+
+/* ==================== 网页搜索与抓取服务 ==================== */
+// 默认使用 DeepSeek 官方搜索/抓取接口，可切换回 Ollama（见 config.webSearch.provider）
+const web = new WebService({
+  http: axios,
+  getDeepSeekKey: () => config.deepseek.apiKey,
+  getOllamaKey: () => config.webSearch.apiKey,
+  getProvider: async () => await redis.get(rk('web_provider')) || config.webSearch.provider,
+  ollamaSearchUrl: config.webSearch.ollamaSearchUrl,
+  ollamaFetchUrl: config.webSearch.ollamaFetchUrl,
+  logger
 });
 
 /* ==================== 长期记忆服务 ==================== */
@@ -710,24 +723,6 @@ function modelSupportsVision(model) {
 /* ==================== 联网搜索（Ollama Web Search Cloud API） ==================== */
 
 // DeepSeek Web Search 工具定义
-const webSearchTool = {
-  type: 'function',
-  function: {
-    name: 'ollama_web_search',
-    description: '当用户询问实时信息、新闻、天气、体育赛事结果、股票价格或任何需要当前互联网知识才能回答的问题时，调用此工具进行网页搜索。',
-    parameters: {
-      type: 'object',
-      properties: {
-        query: {
-          type: 'string',
-          description: "要搜索的关键词或问题，例如 '今天北京的天气怎么样' 或 '英伟达最新股价'"
-        }
-      },
-      required: ['query']
-    }
-  }
-};
-
 // ==================== 成员资料查询工具（member_profile_query）====================
 // 纯数据查询接口：AI 根据工具描述自行判断查什么、传什么参数（不在此做正则意图分类）
 const memberProfileQueryTool = {
@@ -843,46 +838,7 @@ function executeProfileQuery(action, target, days, groupId, isMaster, context = 
   return [buildUserContext([found.userid], groupId, context), memory.context({ ...recall, userIds: [found.userid], subjectIds: [found.userid], query: t })].filter(Boolean).join('\n') || `用户「${found.user.name}」暂无更多资料。`;
 }
 
-// 执行 Ollama Web Search
-async function executeOllamaWebSearch(query) {
-  const { apiKey, apiUrl, maxResults, timeout } = config.webSearch;
-  logger.info(`[DeepSeek-WebSearch] 正在调用 Ollama Cloud API: ${query}`);
 
-  if (!apiKey || apiKey.startsWith('your_')) {
-    logger.error('[DeepSeek-WebSearch] 错误：OLLAMA_API_KEY 未在 config.js 中配置');
-    return JSON.stringify({ error: 'Ollama API Key 未配置' });
-  }
-
-  try {
-    const response = await axios.post(apiUrl,
-      {
-        query: query,
-        max_results: maxResults
-      },
-      {
-        headers: {
-          'Authorization': `Bearer ${apiKey}`,
-          'Content-Type': 'application/json'
-        },
-        timeout: timeout
-      }
-    );
-
-    logger.info(`[DeepSeek-WebSearch] Ollama API 搜索完成，返回${response.data.results.length}条结果。`);
-    return JSON.stringify(response.data);
-
-  } catch (error) {
-    let errorMsg = error.message;
-    if (error.response) {
-      errorMsg = error.response.data ? JSON.stringify(error.response.data) : error.message;
-      if (error.response.status === 401) {
-        errorMsg = 'Ollama API Key 无效或未授权 (401)';
-      }
-    }
-    logger.error(`[DeepSeek-WebSearch] Ollama Cloud API 调用失败:`, errorMsg);
-    return JSON.stringify({ error: 'Ollama Cloud API 搜索失败', message: errorMsg });
-  }
-}
 
 /* ==================== 人设模板渲染 ==================== */
 
@@ -943,6 +899,7 @@ export class DeepSeek extends plugin {
         { reg: `^#(?:${escapeRegExp(CMD.companion.replace(/^#/, ''))}[\\s\\S]*|(?:开启|开始|停止|关闭|退出)陪伴)$`, fnc: 'companionCommand' },
         { reg: `^${escapeRegExp(CMD.reset)}$`, fnc: 'reset' },
         { reg: `^${escapeRegExp(CMD.adminPrefix)}帮助$`, fnc: 'help', permission: 'master' },
+        { reg: `^${escapeRegExp(CMD.adminPrefix)}搜索服务(?:\\s|$)[\\s\\S]*$`, fnc: 'setWebProvider', permission: 'master' },
         { reg: `^${escapeRegExp(CMD.adminPrefix)}设置上下文长度(.*)$`, fnc: 'setMaxLength', permission: 'master' },
         { reg: `^${escapeRegExp(CMD.adminPrefix)}设置群聊记录长度(.*)$`, fnc: 'setHistoryLength', permission: 'master' },
         { reg: `^${escapeRegExp(CMD.adminPrefix)}设置提示词(.*)$`, fnc: 'setPrompt', permission: 'master' },
@@ -1011,6 +968,7 @@ export class DeepSeek extends plugin {
   ${CMD.adminPrefix}设置群聊记录长度 <数字> - 设置群聊历史长度
   ${CMD.adminPrefix}设置提示词 <内容> - 设置自定义系统提示词
   ${CMD.adminPrefix}设置思考过程 <关闭|开启|转发> - 设置思考过程显示方式
+  ${CMD.adminPrefix}搜索服务 [deepseek|ollama] - 查看或切换搜索与抓取服务（默认 deepseek）
 
 📁 人工资料（仅master）：
   ${CMD.chatPrefix}资料查看 <昵称/userid> - 查看用户资料
@@ -1080,7 +1038,7 @@ export class DeepSeek extends plugin {
   // 默认人设来自 config.js（可自定义）；也可用 #ds设置提示词 写入自定义提示词（存 redis，优先于默认值）
   // 完整系统提示词 = 基础人设 + 记忆使用规则（记忆规则不可被自定义提示词覆盖）
   async buildSystemPrompt(e, customPrompt) {
-    return `${await this.buildBaseSystemPrompt(e, customPrompt)}\n${MEMORY_RULES}`;
+    return `${await this.buildBaseSystemPrompt(e, customPrompt)}\n${MEMORY_RULES}\n${WEB_RULES}`;
   }
 
   // 基础人设（不含记忆规则）：安全规则段对默认与自定义提示词均强制追加
@@ -1327,6 +1285,7 @@ export class DeepSeek extends plugin {
     const parsedMsgContent = rawParsedContent.length > MAX_MSG_LEN ? `${rawParsedContent.slice(0, MAX_MSG_LEN)}…（内容过长已截断）` : rawParsedContent;
     // 入队原始消息，供后台异步提取长期记忆（立即提取，不等待延时批次）
     token.source = memory.observe(e, parsedMsgContent, true);
+    token.webQuestion = parsedMsgContent;
 
     const gender = await getUserGenderWithCache(e.bot, e.user_id, e.group?.group_id);
     const genderSymbol = GENDER_MAP[gender] || '';
@@ -1434,122 +1393,70 @@ export class DeepSeek extends plugin {
 
     let messages = [...prompt, msg];
 
-    let tools = [];
-    if (ENABLE_WEB_SEARCH) {
-      tools.push(webSearchTool);
-    }
-    // 成员资料查询工具始终可用（本地资料库，不依赖联网开关）
-    tools.push(memberProfileQueryTool);
+    const tools = [...(ENABLE_WEB_SEARCH ? WEB_TOOLS : []), memberProfileQueryTool];
+    // 仅把用户本人的问题发给搜索接口，不携带群成员资料、群历史或系统提示词
+    const webSession = web.createSession(token.webQuestion || String(e.msg || '').replace(new RegExp(`^${escapeRegExp(CMD.chatPrefix)}\\s*`), ''));
+    let calls = 0, progressSent = false;
 
     try {
-      logger.info('[DeepSeek] 正在调用 DeepSeek API');
-
-      const apiParams = {
-        messages: messages,
-        model: currentModel,
-        temperature: parseFloat(temperature),
-        frequency_penalty: config.deepseek.frequencyPenalty,
-        presence_penalty: config.deepseek.presencePenalty,
-        tools: tools.length > 0 ? tools : undefined,
-        tool_choice: tools.length > 0 ? 'auto' : undefined,
-      };
-
-      if (thinkingEnabled) {
-        apiParams.thinking = { type: 'enabled' };
-        apiParams.reasoning_effort = config.deepseek.thinking.reasoningEffort;
-      }
-
-      const completion = await openai.chat.completions.create(apiParams);
-      if (!memory.current(token)) return; // 会话已重置/关闭，丢弃在途结果
-
-      let choice = completion.choices[0];
-      let responseMessage = choice.message;
-
-      if (responseMessage.tool_calls && responseMessage.tool_calls.length > 0) {
-        logger.info('[DeepSeek] 检测到工具调用请求:', responseMessage.tool_calls[0].function.name);
-
-        messages.push(responseMessage);
-
-        for (const toolCall of responseMessage.tool_calls) {
-          if (!memory.current(token)) return;
-          if (toolCall.function.name === 'ollama_web_search') {
-            let args;
-            try {
-              args = JSON.parse(toolCall.function.arguments || '{}');
-            } catch (err) {
-              logger.error('[DeepSeek] 工具参数解析失败:', err);
-              // 配对完整性：解析失败也补一条 tool 结果，否则 API 会因缺少结果而 400 拒绝
-              messages.push({
-                role: 'tool',
-                tool_call_id: toolCall.id,
-                content: JSON.stringify({ error: '工具参数解析失败' })
-              });
-              continue;
-            }
-            const query = args.query;
-
-            e.reply('正在查找相关资料，请稍等♪～');
-
-            const searchResultJson = await executeOllamaWebSearch(query);
-
-            messages.push({
-              role: 'tool',
-              tool_call_id: toolCall.id,
-              content: searchResultJson
-            });
-          } else if (toolCall.function.name === 'member_profile_query') {
-            let args;
-            try {
-              args = JSON.parse(toolCall.function.arguments || '{}');
-            } catch (err) {
-              logger.error('[DeepSeek] 资料查询参数解析失败:', err);
-              messages.push({
-                role: 'tool',
-                tool_call_id: toolCall.id,
-                content: JSON.stringify({ error: '资料查询参数解析失败' })
-              });
-              continue;
-            }
-            // 主人判定：框架 isMaster 或资料库 role=master
-            const isMaster = e.isMaster === true || getUserByUid(e.user_id)?.role === 'master';
-            // 成员范围：按本轮涉及的用户重新取得授权 context（成员表可能已刷新）
-            const queryContext = await profileQueryContext(e, token.queryContext?.userIds);
-            const result = executeProfileQuery(args.action, args.target, args.days, e.group_id, isMaster, queryContext);
-            messages.push({
-              role: 'tool',
-              tool_call_id: toolCall.id,
-              content: result
-            });
-          } else {
-            // 未知工具：补错误结果，保证 tool_calls 与 tool 结果一一配对（否则 API 400）
-            logger.warn(`[DeepSeek] 未知工具调用: ${toolCall.function.name}`);
-            messages.push({
-              role: 'tool',
-              tool_call_id: toolCall.id,
-              content: JSON.stringify({ error: `未知工具: ${toolCall.function.name}` })
-            });
-          }
-        }
-
-        logger.info('[DeepSeek] 正在发送工具调用结果以获取最终回复...');
-        // 说明：此处刻意不携带 tools/tool_choice，避免模型再次发起工具调用造成死循环；
-        // 当前交互为"至多一轮搜索 → 出最终回复"，如需多轮工具调用请改为带轮数上限的循环
-        const finalApiParams = {
-          messages: messages,
+      let responseMessage;
+      // 最多三轮工具调用：每轮可先搜索、再对相关链接读取原文；之后关闭工具要求收束回答
+      for (let round = 0; round <= 3; round++) {
+        if (!memory.current(token)) return;
+        const allowTools = round < 3 && calls < 8;
+        if (!allowTools) messages.push({ role: 'system', content: '本轮工具调用已结束。只根据已取得的资料回答；空结果、失败或截断须如实说明，不要声称读取了未取得的内容。' });
+        const apiParams = {
+          messages,
           model: currentModel,
           temperature: parseFloat(temperature),
           frequency_penalty: config.deepseek.frequencyPenalty,
           presence_penalty: config.deepseek.presencePenalty,
+          ...(allowTools ? { tools, tool_choice: 'auto' } : {}),
+          ...(thinkingEnabled ? { thinking: { type: 'enabled' }, reasoning_effort: config.deepseek.thinking.reasoningEffort } : {})
         };
-
-        if (thinkingEnabled) {
-          finalApiParams.thinking = { type: 'enabled' };
-          finalApiParams.reasoning_effort = config.deepseek.thinking.reasoningEffort;
+        const completion = await openai.chat.completions.create(apiParams);
+        if (!memory.current(token)) return; // 会话已重置/关闭，丢弃在途结果
+        responseMessage = completion.choices?.[0]?.message;
+        if (!responseMessage) throw Error('模型未返回有效消息');
+        const toolCalls = responseMessage.tool_calls;
+        if (!Array.isArray(toolCalls) || !toolCalls.length) break;
+        if (!allowTools) throw Error('模型在工具关闭后仍返回工具调用');
+        // 保留 thinking 模型返回的 reasoning_content，后续轮次按原样回传
+        messages.push(responseMessage);
+        for (const toolCall of toolCalls) {
+          if (!memory.current(token)) return;
+          let result;
+          calls++;
+          try {
+            if (calls > 8) result = JSON.stringify({ ok: false, error: { code: 'tool_limit', message: '本轮工具调用次数已用完' } });
+            else {
+              const args = JSON.parse(toolCall.function?.arguments || '{}');
+              if (!args || typeof args !== 'object' || Array.isArray(args)) throw Error('工具参数必须是对象');
+              const name = toolCall.function?.name;
+              if (['web_search', 'web_fetch', 'ollama_web_search'].includes(name)) {
+                if (!ENABLE_WEB_SEARCH) result = JSON.stringify({ ok: false, error: { code: 'web_disabled', message: '联网功能未开启' } });
+                else {
+                  if (!progressSent) {
+                    progressSent = true;
+                    // 进度提示发送失败不影响正式回答
+                    try { await e.reply('正在查找和阅读相关资料，请稍等♪～'); } catch { /* 继续 */ }
+                  }
+                  if (!memory.current(token)) return;
+                  result = await web.execute(name, args, webSession);
+                }
+              } else if (name === 'member_profile_query') {
+                const isMaster = e.isMaster === true || getUserByUid(e.user_id)?.role === 'master';
+                const queryContext = await profileQueryContext(e, token.queryContext?.userIds);
+                result = executeProfileQuery(args.action, args.target, args.days, e.group_id, isMaster, queryContext);
+              } else result = JSON.stringify({ ok: false, error: { code: 'unknown_tool', message: '未知工具' } });
+            }
+          } catch {
+            result = JSON.stringify({ ok: false, error: { code: 'tool_error', message: '工具参数无效或调用未成功；没有取得可用结果' } });
+          }
+          if (!memory.current(token)) return;
+          // 即使解析失败或达到次数上限，也要为每个 tool_call_id 配对结果，否则 API 会 400
+          messages.push({ role: 'tool', tool_call_id: toolCall.id, content: result });
         }
-
-        const finalCompletion = await openai.chat.completions.create(finalApiParams);
-        if (!memory.current(token)) return;
-        responseMessage = finalCompletion.choices[0].message;
       }
 
       let originalRetMsg = responseMessage.content;
@@ -1638,6 +1545,15 @@ export class DeepSeek extends plugin {
     }
 
     return matches;
+  }
+
+  // 查看/切换搜索与抓取服务（deepseek 官方 / ollama 兼容）
+  async setWebProvider(e) {
+    const provider = String(e.msg || '').replace(new RegExp(`^${escapeRegExp(CMD.adminPrefix)}搜索服务\\s*`), '').trim().toLowerCase();
+    if (!provider) return e.reply(`当前搜索与抓取服务：${await redis.get(rk('web_provider')) || config.webSearch.provider}。可用 ${CMD.adminPrefix}搜索服务 deepseek 或 ${CMD.adminPrefix}搜索服务 ollama 切换。`);
+    if (!['deepseek', 'ollama'].includes(provider)) return e.reply(`用法：${CMD.adminPrefix}搜索服务 deepseek 或 ${CMD.adminPrefix}搜索服务 ollama`);
+    await redis.set(rk('web_provider'), provider);
+    return e.reply(`搜索与抓取服务已切换为 ${provider}，下一轮对话生效。`);
   }
 
   async setMaxLength(e) {
