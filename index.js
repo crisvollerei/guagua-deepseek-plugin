@@ -31,6 +31,7 @@ import { dirname } from 'node:path';
 import { config } from './config.js';
 import { MemoryService, MEMORY_RULES, sessionKey, normalizeId } from './guagua-memory.mjs';
 import { WebService, WEB_TOOLS, WEB_RULES } from './guagua-web.mjs';
+import { ReplyDelivery, REPLY_RULES, planReply, prefersSingleReply } from './guagua-reply.mjs';
 
 // 框架全局注入 common；缺失时兜底，保证独立加载 / 热重载不因框架差异崩溃
 const common = global.common || {
@@ -41,6 +42,11 @@ const common = global.common || {
     return messages.join('\n');
   }
 };
+
+
+/* ==================== 回复发送器 ==================== */
+// 结构化回复（多条消息 / 合并转发 / 单条）的分次发送与失败续发
+const replyDelivery = new ReplyDelivery({ sleep: ms => common.sleep(ms) });
 
 /* ==================== 全局常量 ==================== */
 const REDIS_PREFIX = config.redisKeyPrefix || 'deepseekJS';
@@ -1038,7 +1044,7 @@ export class DeepSeek extends plugin {
   // 默认人设来自 config.js（可自定义）；也可用 #ds设置提示词 写入自定义提示词（存 redis，优先于默认值）
   // 完整系统提示词 = 基础人设 + 记忆使用规则（记忆规则不可被自定义提示词覆盖）
   async buildSystemPrompt(e, customPrompt) {
-    return `${await this.buildBaseSystemPrompt(e, customPrompt)}\n${MEMORY_RULES}\n${WEB_RULES}`;
+    return `${await this.buildBaseSystemPrompt(e, customPrompt)}\n${MEMORY_RULES}\n${WEB_RULES}\n${REPLY_RULES}`;
   }
 
   // 基础人设（不含记忆规则）：安全规则段对默认与自定义提示词均强制追加
@@ -1379,6 +1385,7 @@ export class DeepSeek extends plugin {
       state.buffer = [];
       state.seq = 0;
       state.lastEvaluatedSeq = 0;
+      state.pendingReply = null;   // 停止未发完的回复
       clearTimeout(state.retryTimer);
       memory.safe(() => memory.store.companion(getHistoryKey(e), state));
     }
@@ -1396,7 +1403,7 @@ export class DeepSeek extends plugin {
     const tools = [...(ENABLE_WEB_SEARCH ? WEB_TOOLS : []), memberProfileQueryTool];
     // 仅把用户本人的问题发给搜索接口，不携带群成员资料、群历史或系统提示词
     const webSession = web.createSession(token.webQuestion || String(e.msg || '').replace(new RegExp(`^${escapeRegExp(CMD.chatPrefix)}\\s*`), ''));
-    let calls = 0, progressSent = false;
+    let calls = 0, progressSent = false, delivery;
 
     try {
       let responseMessage;
@@ -1459,12 +1466,9 @@ export class DeepSeek extends plugin {
         }
       }
 
-      let originalRetMsg = responseMessage.content;
-
-      // 兼容旧回复中的元数据；正式记忆由独立提取流程处理（带证据校验）
-      const memParsed = parseMemMeta(originalRetMsg);
-      originalRetMsg = memParsed.text;
-      applyLearnedMeta(memParsed.meta, token.source ? [token.source] : []);
+      const plan = this.prepareReply(responseMessage.content, token.source ? [token.source] : [], {
+        single: prefersSingleReply(token.webQuestion || e.msg || '')
+      });
 
       // 思考过程：工具路径下 responseMessage 已指向最终响应，无需再回退到首次请求
       let thinking = thinkingEnabled ? responseMessage.reasoning_content : null;
@@ -1479,37 +1483,42 @@ export class DeepSeek extends plugin {
         await common.sleep(1000);
       }
 
-      // 空回复保护：AI 未产出有效内容（如工具路径 content 为 null 或只剩元数据）时不发送空消息
-      if (!originalRetMsg || !originalRetMsg.trim()) {
-        logger.warn(`[DeepSeek] AI 返回空回复 (groupId: ${e.group_id})`);
-        return;
-      }
-
-      let matches = await this.dealMessage(e, originalRetMsg);
-      if (!memory.current(token)) return;
-      const sent = await e.reply(matches, true);
-      // 部分协议端发送失败返回 false/null；此时不写入历史，保持上下文与实际对话一致
-      if (sent === false || sent === null) throw new Error('消息未发送成功');
-      if (!memory.current(token)) return;
-
-      // 历史记录存文本版：图片转为文字说明，避免历史重复携带 base64 大图
+      // 空回复保护：模型没有产出任何可发送内容时不发空消息
+      if (!plan.messages.length && !plan.sections.length) return;
       const historyContent = historyText || (Array.isArray(msg?.content)
-        ? `${msg.content.find((p) => p.type === 'text')?.text || ''}${msg.content.some((p) => p.type === 'image_url') ? `（附${msg.content.filter((p) => p.type === 'image_url').length}张图片）` : ''}`
+        ? `${msg.content.find((p) => p.type === 'text')?.text || ''}${msg.content.some((p) => p.type === 'image_url') ? '（附图片）' : ''}`
         : msg.content);
-      // 持久化到记忆库（按 maxLength 轮滚动，溢出部分进入摘要队列）
-      memory.safe(() => memory.store.appendHistory(getHistoryKey(e), [
-        { role: 'user', content: historyContent },
-        { role: 'assistant', content: sanitizeCQ(originalRetMsg) }
-      ], maxLength));
+      delivery = replyDelivery.create(plan);
+      await replyDelivery.send(delivery, {
+        valid: () => memory.current(token),
+        render: (text, seen) => this.dealMessage(e, text, seen),
+        makeForward: nodes => common.makeForwardMsg(e, nodes),
+        send: (payload, quote) => e.reply(payload, quote),
+        attempts: 2,
+        onProgress: () => {
+          // 每条发送成功即记录进度：只保存实际发出的正文，便于失败后续发
+          if (memory.current(token)) memory.safe(() => memory.store.recordReply(getHistoryKey(e), delivery, historyContent, maxLength));
+        }
+      });
 
     } catch (error) {
       logger.error(`[DeepSeek] AI对话请求失败:`, error);
-      if (memory.current(token)) await e.reply('AI对话请求发送失败', true);
+      if (memory.current(token)) await e.reply(delivery?.history.length ? '后面的消息暂时没有发送成功。' : 'AI对话请求发送失败', !delivery?.quoteUsed);
     }
   }
 
+  // 把模型输出解析为可发送的回复计划：
+  // 同时剥离【MEM】学习元数据、清洗非 @ 的 CQ 码，并对每段正文做同样处理。
+  prepareReply(raw, sources = [], options = {}) {
+    return planReply(raw, { ...options, cleanText: text => {
+      const parsed = parseMemMeta(text);
+      applyLearnedMeta(parsed.meta, sources);
+      return sanitizeCQ(parsed.text);
+    } });
+  }
+
   // 处理回复中的@符号；同时清洗其余 CQ 码防止透传，并对成员查询做空引用兜底
-  async dealMessage(e, originalRetMsg) {
+  async dealMessage(e, originalRetMsg, mentioned = new Set()) {
     // 先清洗非 @ 的 CQ 码为文本占位，防止恶意 CQ 码被机器人代发
     let msg = sanitizeCQ(originalRetMsg);
 
@@ -1532,7 +1541,9 @@ export class DeepSeek extends plugin {
         nickname = null;
       }
       if (nickname != undefined && nickname != null) {
-        matches.push(segment.at(userId, nickname));
+        // 同一轮相同成员只 @ 一次，后续提及改为纯文本，避免反复提醒
+        if (mentioned.has(userId)) matches.push(String(nickname));
+        else { matches.push(segment.at(userId, nickname)); mentioned.add(userId); }
       } else {
         // 查不到成员/私聊时保留原文，不静默丢弃（否则 @ 段会从回复中消失）
         matches.push(msg.slice(match.index, atRegex.lastIndex));
@@ -1702,7 +1713,7 @@ export class DeepSeek extends plugin {
         logger.error(`[DeepSeek-陪伴] 写入陪伴开关失败 (${gid}):`, err);
       }
       const old = companionState.get(gid);
-      if (old) { old.enabled = false; clearTimeout(old.retryTimer); }
+      if (old) { old.enabled = false; old.pendingReply = null; clearTimeout(old.retryTimer); }
       memory.invalidate(e);
       memory.safe(() => memory.store.companion(getHistoryKey(e), null));
       companionOffCache.set(gid, Date.now());
@@ -1842,8 +1853,8 @@ export class DeepSeek extends plugin {
 
   // 尝试触发一次判断：判断锁 + 最短CD控制
   async tryCompanionDecide(e, state) {
-    // 状态有效性：已关闭 / 已被新实例替换 / 判断进行中 / 无待判断消息，都直接返回
-    if (!state.enabled || companionState.get(normalizeId(e.group_id)) !== state || state.deciding || !state.buffer.length) return;
+    // 状态有效性：已关闭 / 已被新实例替换 / 判断进行中 / 既无待判断消息也无待续发回复，都直接返回
+    if (!state.enabled || companionState.get(normalizeId(e.group_id)) !== state || state.deciding || (!state.buffer.length && !state.pendingReply)) return;
     // 未到最短CD：安排一次到点重试，避免消息一直躺着不判断
     if (Date.now() - state.lastDecision < COMPANION_CONFIG.decisionCooldown) {
       this.scheduleCompanion(e, state);
@@ -1860,7 +1871,7 @@ export class DeepSeek extends plugin {
       state.deciding = false;
       state.lastDecision = Date.now();
       // 判断期间又来了新消息 → 继续调度下一轮
-      if (state.buffer.some(m => m.seq > (state.lastEvaluatedSeq || 0))) this.scheduleCompanion(e, state);
+      if (state.pendingReply || state.buffer.some(m => m.seq > (state.lastEvaluatedSeq || 0))) this.scheduleCompanion(e, state);
     }
   }
 
@@ -1881,12 +1892,46 @@ export class DeepSeek extends plugin {
     await memory.processSummary(getHistoryKey(e));
   }
 
+  // 续发/发送陪伴回复：每条成功即记录进度；首条成功后才把对应原文标记为已处理，
+  // 后续失败只续发剩余部分，不重新生成首条。
+  async sendCompanionReply(e, state, token) {
+    const pending = state.pendingReply;
+    const valid = () => memory.current(token) && state.enabled && companionState.get(normalizeId(e.group_id)) === state && state.pendingReply === pending;
+    if (!pending || pending.epoch !== token.epoch || !valid()) { state.pendingReply = null; return; }
+    const completed = await replyDelivery.send(pending.delivery, {
+      valid,
+      render: (text, seen) => this.dealMessage(pending.event, text, seen),
+      makeForward: nodes => common.makeForwardMsg(pending.event, nodes),
+      send: (payload, quote) => pending.event.reply(payload, quote),
+      onProgress: () => {
+        if (!valid()) return;
+        memory.safe(() => memory.store.recordReply(pending.historyKey, pending.delivery, pending.userContent, pending.maxLength));
+        // 首条成功后就提交已处理原文；后续失败只续发，不再重生成或重复首条。
+        if (!pending.counted) {
+          state.buffer = state.buffer.filter(m => m.seq > pending.handledSeq);
+          state.lastEvaluatedSeq = Math.max(state.lastEvaluatedSeq || 0, pending.handledSeq);
+          state.replies += 1;
+          pending.counted = true;
+        }
+        state.lastReply = Date.now();
+        memory.safe(() => memory.store.companion(pending.historyKey, state));
+      }
+    });
+    if (completed && valid()) logger.info('[DeepSeek-陪伴] 分次回复已完成');
+    if (state.pendingReply === pending) state.pendingReply = null;
+  }
+
   // 判断 + 回复：把累积消息交给 AI 判断是否该插话；需要回复时基于最新消息生成简短回复
   // token 标记会话世代：判断期间若被重置/关闭，旧结果直接作废，不再发送
   async companionDecide(e, state, token = memory.token(e)) {
     const gid = normalizeId(e.group_id);
     const valid = () => memory.current(token) && state.enabled && companionState.get(gid) === state;
     if (!valid()) return;
+    // 上一轮回复未发完：优先续发剩余部分，不重新判断也不重新生成
+    if (state.pendingReply) {
+      if (state.pendingReply.epoch === token.epoch) return this.sendCompanionReply(e, state, token);
+      state.pendingReply = null;
+    }
 
     // 人设 + 陪伴模式说明
     const systemContent = (await this.buildSystemPrompt(e, await redis.get(rk('prompt')))) + `
@@ -1951,7 +1996,7 @@ ${bufLines}
 - 记忆由后台独立处理，无需在本次输出记忆字段
 - 若需要查询成员资料/生日/日期才能给出准确回复（如"几天后是什么日子"），可附带 need_query:{"action":"user_info或upcoming_birthdays或full_export","target":"用户昵称(查单用户时填)","days":数字(查未来N天生日时填，可选)}（无则省略该字段）
 严格输出JSON（不要输出JSON以外的任何内容）：
-{"should_reply": true或false, "reply": "回复内容(should_reply为false时为空字符串)", "reason": "一句话说明判断原因", "need_query": 可选}`.trim()
+{"should_reply": true或false, "reply": {"reply_format":"guagua-v1","mode":"chat","messages":["自然回复","必要时的补充"]}, "reason": "一句话说明判断原因", "need_query": 可选}。无需回复时reply为""。`.trim()
     });
 
     const currentModel = await redis.get(rk('model_type')) || config.deepseek.defaultModel;
@@ -1976,7 +2021,7 @@ ${bufLines}
     applyLearnedMeta(json, sources);
     const shouldReply = json.should_reply === true || json.should_reply === 'true';
     const needQuery = json.need_query && typeof json.need_query === 'object' ? json.need_query : null;
-    if (!shouldReply || (typeof json.reply !== 'string' && !needQuery)) {
+    if (!shouldReply || ((!json.reply || !['string', 'object'].includes(typeof json.reply)) && !needQuery)) {
       state.lastEvaluatedSeq = sentSeq;
       logger.info(`[DeepSeek-陪伴] 本轮无需回复 (${json.reason || '无理由'})，缓冲${state.buffer.length}条待续`);
       memory.safe(() => memory.store.companion(historyKey, state));
@@ -1989,7 +2034,7 @@ ${bufLines}
       return;
     }
 
-    let replyText = typeof json.reply === 'string' ? json.reply.trim() : '';
+    let replyText = typeof json.reply === 'string' ? json.reply.trim() : json.reply;
     let handledSeq = sentSeq;
 
     // 需要回复：拼接判断期间新到的消息（按 seq 精准识别）+ 按需资料查询（need_query），确保回复基于最新/准确信息
@@ -2013,7 +2058,7 @@ ${bufLines}
       }
       messages.push({
         role: 'user',
-        content: `${extra.join('\n\n')}\n请结合以上信息，基于你刚才的回复意图（"${replyText}"），给出最终回复。同样要求简短口语化。直接输出最终回复内容本身，不要输出JSON。`.trim()
+        content: `${extra.join('\n\n')}\n请结合以上信息，基于你刚才的回复意图（"${typeof replyText === 'string' ? replyText : JSON.stringify(replyText)}"），给出最终回复。保持简短口语化，使用reply_format=guagua-v1的消息格式，按自然停顿组织messages；不再输出should_reply等判断字段。`.trim()
       });
       try {
         const finalCompletion = await openai.chat.completions.create({
@@ -2041,30 +2086,19 @@ ${bufLines}
     if (!valid()) return;
     applyLearnedMeta(memParsed.meta, [...sources, ...newMsgs.map(m => m.source).filter(Boolean)]);
 
-    // 空回复保护：剥离元数据后若已无有效内容，则标记已评估但不发送空消息
-    if (!replyText.trim()) { state.lastEvaluatedSeq = handledSeq; return; }
-
-    const matches = await this.dealMessage(e, replyText);
     if (!valid()) return;
-    const sent = await e.reply(matches, true);
-    // 发送失败时抛错：消息保留在缓冲，稍后重试，避免"以为回了其实没回"
-    if (sent === false || sent === null) throw new Error('陪伴回复发送未成功，消息仍保留');
-    if (!valid()) return;
-
-    // 仅移除已处理的消息，判断期间新到的消息继续保留给下一轮
+    const plan = this.prepareReply(replyText, [...sources, ...newMsgs.map(m => m.source).filter(Boolean)], {
+      companion: true, single: prefersSingleReply(sentBuffer.map(m => m.source?.text || m.content).join('\n'))
+    });
+    // 无可发送内容：标记已评估但不发空消息
+    if (!plan.messages.length && !plan.sections.length) { state.lastEvaluatedSeq = handledSeq; return; }
     const repliedBuffer = state.buffer.filter(m => m.seq <= handledSeq);
-    state.buffer = state.buffer.filter(m => m.seq > handledSeq);
-    state.lastEvaluatedSeq = handledSeq;
-    state.lastReply = Date.now();
-    state.replies += 1;
-
-    // 记录到对话历史，保持上下文连贯（群聊/私聊用 key 隔离，不串扰）
-    memory.safe(() => memory.store.appendHistory(historyKey, [
-      { role: 'user', content: repliedBuffer.map(m => `${new Date(m.time).toISOString()} userid=${m.userId}（${m.card}）：${wrapUntrusted(m.content)}`).join('\n') },
-      { role: 'assistant', content: sanitizeCQ(replyText) }
-    ], maxLength));
-    memory.safe(() => memory.store.companion(historyKey, state));
-    logger.info(`[DeepSeek-陪伴] 主动回复: ${replyText}`);
+    // 未发完的回复挂在 state 上：发送失败/被打断时下次调度续发剩余部分
+    state.pendingReply = {
+      delivery: replyDelivery.create(plan), epoch: token.epoch, event: e, handledSeq, historyKey, maxLength,
+      userContent: repliedBuffer.map(m => `${new Date(m.time).toISOString()} userid=${m.userId}（${m.card}）：${wrapUntrusted(m.content)}`).join('\n')
+    };
+    await this.sendCompanionReply(e, state, token);
   }
 }
 
@@ -2082,6 +2116,7 @@ export class GuaguaGroupNotice extends plugin {
       const state = companionState.get(normalizeId(e.group_id));
       if (state && state.sessionKey === sessionKey(e)) {
         clearTimeout(state.retryTimer);
+        state.pendingReply = null;   // 成员变动后停止未发完的回复
         const present = memory.roster.ids(normalizeId(e.self_id || e.bot?.uin || 'default'), e.group_id);
         state.buffer = state.buffer.filter(item => present.includes(normalizeId(item.userId)));
         memory.safe(() => memory.store.companion(state.sessionKey, state));

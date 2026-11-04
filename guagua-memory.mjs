@@ -339,7 +339,7 @@ export class MemoryStore {
         });
     }
 
-    history(key, rounds) { return rounds > 0 ? clone((this.data.sessions[key]?.history || []).slice(-rounds * 2)) : []; }
+    history(key, rounds) { return rounds > 0 ? (this.data.sessions[key]?.history || []).slice(-rounds * 2).map(m => ({ role: m.role, content: m.content })) : []; }
     summary(key, rounds) { return rounds > 0 ? this.data.sessions[key]?.summary || '' : ''; }
 
     appendHistory(key, messages, rounds) {
@@ -347,11 +347,31 @@ export class MemoryStore {
             const s = data.sessions[key] ||= emptySession(this.now());
             s.updatedAt = this.now();
             if (!rounds) { s.history = []; return; }
-            const all = [...s.history, ...messages].map(m => ({ role: m.role, content: text(m.content, 3500) }));
+            const all = [...s.history, ...messages].map(m => ({ role: m.role, content: text(m.content, 3500), ...(m.replyId ? { replyId: m.replyId } : {}) }));
             const removed = all.splice(0, Math.max(0, all.length - rounds * 2));
             s.pendingSummary.push(...removed);
             s.history = all;
         });
+    }
+
+    recordReply(key, delivery, userContent, rounds) {
+        if (!delivery.history.length) return;
+        const previousParts = delivery.recordedParts || 0;
+        this.change(data => {
+            const s = data.sessions[key] ||= emptySession(this.now());
+            s.updatedAt = this.now();
+            if (!rounds) { s.history = []; return; }
+            const full = delivery.history.join('\n\n');
+            const existing = [...s.history, ...s.pendingSummary].find(m => m.role === 'assistant' && m.replyId === delivery.id);
+            if (existing) existing.content = text(full, 3500);
+            else {
+                const assistant = { role: 'assistant', content: text(delivery.history.slice(previousParts).join('\n\n'), 3500), replyId: delivery.id };
+                s.history.push(...(previousParts ? [assistant] : [{ role: 'user', content: text(userContent, 3500) }, assistant]));
+                const removed = s.history.splice(0, Math.max(0, s.history.length - rounds * 2));
+                s.pendingSummary.push(...removed);
+            }
+        });
+        delivery.recordedParts = delivery.history.length;
     }
 
     queueSummary(key, messages) {
