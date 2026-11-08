@@ -1,9 +1,13 @@
 {
   "name": "guagua-deepseek-plugin",
   "version": "1.0.0",
-  "description": "DeepSeek 聊天插件（trss-yunzai）：#呱瓜 对话 + #陪伴 陪伴模式",
+  "description": "DeepSeek 聊天插件（trss-yunzai）：自然分段对话、限时接话、识图与人物记忆",
   "main": "index.js",
   "type": "module",
+  "scripts": {
+    "test": "node --test",
+    "test:isolation": "node tests/group-isolation-probe.mjs"
+  },
   "author": "crisvollerei",
   "license": "MIT",
   "repository": {
@@ -15,6 +19,6 @@
     "axios": "^1.6.0"
   },
   "engines": {
-    "node": ">=16.0.0"
+    "node": ">=20.0.0"
   }
 }

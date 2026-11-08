@@ -24,11 +24,13 @@ export class GroupRoster {
         this.attempts = new Map();
         this.dirty = false;
         this.blocked = false;
+        this.closed = false;
         try {
             if (fs.existsSync(this.file)) {
                 const data = JSON.parse(fs.readFileSync(this.file, 'utf8').replace(/^\uFEFF/, ''));
-                if (data?.version !== 1 || !data.groups || Array.isArray(data.groups) ||
-                    Object.values(data.groups).some(g => !g || !g.members || Array.isArray(g.members))) throw Error('成员表结构无效');
+                if (data?.version !== 1 || !data.groups || typeof data.groups !== 'object' || Array.isArray(data.groups) ||
+                    Object.values(data.groups).some(g => !g || !g.members || typeof g.members !== 'object' || Array.isArray(g.members) ||
+                        Object.values(g.members).some(m => !m || typeof m !== 'object' || Array.isArray(m) || !['present', 'left'].includes(m.status)))) throw Error('成员表结构无效');
                 this.data = data;
             }
         } catch (error) {
@@ -45,7 +47,7 @@ export class GroupRoster {
     }
 
     noteMessage(e) {
-        if (!e.group_id || !e.user_id || (e.post_type && e.post_type !== 'message') || this.events.has(e)) return;
+        if (this.closed || !e.group_id || !e.user_id || (e.post_type && e.post_type !== 'message') || this.events.has(e)) return;
         this.events.add(e);
         const botId = botIdOf(e), key = keyOf(botId, e.group_id), uid = id(e.user_id), now = this.now();
         const group = this.group(botId, e.group_id), previous = group.members[uid];
@@ -63,7 +65,7 @@ export class GroupRoster {
     }
 
     handleNotice(e) {
-        if (!e.group_id || !e.user_id || e.post_type !== 'notice') return false;
+        if (this.closed || !e.group_id || !e.user_id || e.post_type !== 'notice') return false;
         const type = e.notice_type === 'group_increase' ? 'increase' : e.notice_type === 'group_decrease' ? 'decrease' :
             e.notice_type === 'group' ? e.sub_type : '';
         if (!['increase', 'decrease'].includes(type)) return false;
@@ -119,6 +121,12 @@ export class GroupRoster {
         return this.ids(access.botId, access.groupId);
     }
 
+    authorizedGroup(groupId, context = {}) {
+        const access = this.tokens.get(context.groupAccess);
+        return Boolean(!this.closed && access && access.groupId === id(groupId) && access.botId === id(context.botId) &&
+            id(context.groupId) === id(groupId) && this.data.groups[keyOf(access.botId, access.groupId)]?.botPresent === true);
+    }
+
     names(botId, groupId) {
         const group = this.data.groups[keyOf(botId, groupId)];
         return Object.fromEntries(this.ids(botId, groupId).map(uid => [uid,
@@ -126,6 +134,7 @@ export class GroupRoster {
     }
 
     async ensure(e) {
+        if (this.closed) return;
         const botId = botIdOf(e), groupId = id(e.group_id);
         if (!groupId) return;
         const key = keyOf(botId, groupId), group = this.group(botId, groupId), now = this.now();
@@ -150,6 +159,7 @@ export class GroupRoster {
                 timer.unref?.();
             });
             const result = await Promise.race([Promise.resolve().then(() => target.getMemberMap(true)), timeout]);
+            if (this.closed) return;
             const entries = entriesOf(result);
             if (!entries || entries.some(([uid]) => !/^\d+$/.test(id(uid)))) throw Error('适配器未返回完整成员表');
             // 等待期间入/退群：整次旧快照作废，不能覆盖通知中的最新状态。
@@ -177,16 +187,22 @@ export class GroupRoster {
     }
 
     async tick() {
+        if (this.closed) return;
         this.flush();
         for (const [key, active] of this.active) {
             if (this.now() - active.at > 3600000) { this.active.delete(key); continue; }
             const group = this.data.groups[key];
-            if (!this.fresh.has(key) || this.now() - group.checkedAt >= this.ttl()) { await this.ensure(active.e); break; }
+            if (!this.fresh.has(key) || this.now() - group.checkedAt >= this.ttl()) {
+                this.active.delete(key);
+                this.active.set(key, active);
+                await this.ensure(active.e);
+                break;
+            }
         }
     }
 
     flush() {
-        if (!this.dirty || this.blocked || !fs.existsSync(path.dirname(this.file))) return;
+        if (this.closed || !this.dirty || this.blocked || !fs.existsSync(path.dirname(this.file))) return;
         try {
             const temp = `${this.file}.${process.pid}.tmp`;
             fs.writeFileSync(temp, JSON.stringify(this.data, null, 2), 'utf8');
@@ -195,4 +211,6 @@ export class GroupRoster {
             this.dirty = false;
         } catch (error) { this.logger.error('[呱瓜成员] 保存失败，稍后重试：', error.message); }
     }
+
+    dispose() { if (this.closed) return; this.flush(); this.closed = true; }
 }

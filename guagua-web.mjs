@@ -74,8 +74,17 @@ export class WebService {
         this.slots = new Map();
     }
 
-    createSession(question = '') {
-        return { question: clip(question, 128), requests: 0, usedChars: 0, provider: '', cache: new Map(), sources: new Map() };
+    createSession(question = '', { valid = () => true } = {}) {
+        return { question: clip(question, 128), requests: 0, usedChars: 0, provider: '', cache: new Map(), sources: new Map(), valid };
+    }
+
+    current(session) {
+        try { return !session || typeof session.valid !== 'function' || session.valid(); }
+        catch { return false; }
+    }
+
+    cancelled() {
+        return failure('cancelled', '本轮会话已结束，已停止网页请求', { retryable: false });
     }
 
     sourceId(session, url) {
@@ -83,11 +92,13 @@ export class WebService {
         return session.sources.get(url);
     }
 
-    async slot(provider, kind, start) {
+    async slot(provider, kind, start, valid = () => true) {
         const key = `${provider}:${kind}`, previous = this.slots.get(key) || { chain: Promise.resolve(), nextAt: 0 };
         const chain = previous.chain.then(async () => {
+            if (!valid()) throw Object.assign(Error('网页请求已取消'), { code: 'WEB_CANCELLED' });
             const wait = previous.nextAt - this.now();
             if (wait > 0) await this.sleep(wait);
+            if (!valid()) throw Object.assign(Error('网页请求已取消'), { code: 'WEB_CANCELLED' });
             previous.nextAt = this.now() + 210;
             // 在队列里实际启动请求，不能只预留时刻后让并发调用集中发出。
             const request = Promise.resolve(start());
@@ -100,19 +111,24 @@ export class WebService {
         return request;
     }
 
-    async request(kind, body, provider) {
+    async request(kind, body, provider, session) {
+        if (!this.current(session)) return this.cancelled();
         const key = provider === 'deepseek' ? await this.getDeepSeekKey?.() : await this.getOllamaKey?.();
+        if (!this.current(session)) return this.cancelled();
         if (!key || /^(?:sk-)?x+$/i.test(key)) return failure('missing_api_key', `${provider} 接口密钥未配置`);
         const url = provider === 'deepseek' ? (kind === 'search' ? SEARCH_URL : FETCH_URL) :
             (kind === 'search' ? this.ollamaSearchUrl : this.ollamaFetchUrl);
         for (let attempt = 0; attempt < 2; attempt++) {
+            if (!this.current(session)) return this.cancelled();
             try {
                 const response = await this.slot(provider, kind, () => this.http.post(url, body, {
                     headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
                     timeout: 15000, maxContentLength: 2 * 1024 * 1024, maxBodyLength: 32 * 1024
-                }));
+                }), () => this.current(session));
+                if (!this.current(session)) return this.cancelled();
                 return { ok: true, data: response.data };
             } catch (error) {
+                if (error?.code === 'WEB_CANCELLED' || !this.current(session)) return this.cancelled();
                 const result = httpFailure(error);
                 if (attempt === 0 && result.error.retryable) {
                     const retryAfter = Number(error.response?.headers?.['retry-after']);
@@ -172,6 +188,7 @@ export class WebService {
     }
 
     async execute(name, args, session = this.createSession()) {
+        if (!this.current(session)) return json(this.cancelled());
         const kind = ['web_search', 'ollama_web_search'].includes(name) ? 'search' : name === 'web_fetch' ? 'fetch' : '';
         if (!kind) return json(failure('unknown_tool', '未知网页工具'));
         if (!args || typeof args !== 'object' || Array.isArray(args)) return json(failure('invalid_arguments', '工具参数必须是 JSON 对象'));
@@ -189,6 +206,7 @@ export class WebService {
             body = { url };
         }
         session.provider ||= await this.getProvider();
+        if (!this.current(session)) return json(this.cancelled());
         if (!['deepseek', 'ollama'].includes(session.provider)) return json(failure('invalid_provider', '搜索服务配置须为 deepseek 或 ollama'));
         if (session.provider === 'ollama' && kind === 'search') body = { query: body.query, max_results: count };
         const key = `${kind}:${json(body)}`;
@@ -198,7 +216,8 @@ export class WebService {
         const budget = Math.min(MAX_OUTPUT, TURN_BUDGET - session.usedChars);
         if (budget < 1500) return json(failure('context_budget_exhausted', '本轮网页资料已达到长度上限，请根据已有资料回答'));
         session.requests++;
-        const response = await this.request(kind, body, session.provider);
+        const response = await this.request(kind, body, session.provider, session);
+        if (!this.current(session)) return json(this.cancelled());
         if (!response.ok) return json({ ...response, provider: session.provider, kind });
         const output = kind === 'search' ? this.searchData(response.data, session, body.query, count, budget) : this.fetchData(response.data, session, body.url, budget);
         const result = json(output);

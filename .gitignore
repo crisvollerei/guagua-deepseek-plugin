@@ -32,3 +32,11 @@ memory-config.json
 # 群成员表缓存（含真实群成员名单，请勿提交）
 group-members.json
 group-members.json.bak
+
+# 动图缓存、临时提取结果与本地工作文件
+cache/
+tests/.tmp/
+backups/
+memory.json.*.tmp
+memory-config.json.tmp
+group-members.json.tmp
