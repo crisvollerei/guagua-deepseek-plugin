@@ -52,14 +52,15 @@ function openQuotation(original, position) {
 
 function recentPersonal(fact, value) {
     const bounded = /(?:(?:这|近)(?:两|几|[0-9一二三四五六七八九十]+)(?:天|周|星期|个月|月)|这周|这星期|这个月|本周|本月|这阵子|这段时间|暂时)/u.test(value);
+    const dated = /(?:今天|今晚|昨天|昨晚|这会儿)/u.test(value);
     const state = /(?:发烧|感冒|失眠|生病|不舒服|住院|请假|出差|心情|情绪|胃口|食欲|没精神|难受|备考|很忙|太忙)/u.test(value);
     if (fact.type === 'fact') {
         if (bounded) return true;
         if (['residence', 'occupation', 'birthday', 'age', 'identity', 'ownership', 'project'].includes(fact.claimField)) return false;
-        return state && /(?:最近|近期|目前|今天|这会儿)/u.test(value);
+        return state && (dated || /(?:最近|近期|目前)/u.test(value));
     }
     return (fact.type === 'preference' || (fact.type === 'entity' && ['trait', 'preference'].includes(fact.claimField))) &&
-        (bounded || /(?:最近|近期|目前)/u.test(value));
+        (bounded || dated || /(?:最近|近期|目前)/u.test(value));
 }
 
 function endOfLocalDay(at, offset = 0) {
@@ -69,6 +70,7 @@ function endOfLocalDay(at, offset = 0) {
 
 function referenceExpiry(source, value, fallbackDays) {
     const at = Date.parse(source.at);
+    if (/昨天|昨晚/u.test(value)) return endOfLocalDay(at, -1);
     if (/后天/u.test(value)) return endOfLocalDay(at, 2);
     if (/明天|明晚/u.test(value)) return endOfLocalDay(at, 1);
     if (/今天|今晚/u.test(value)) return endOfLocalDay(at);
@@ -118,6 +120,11 @@ function sameEventOccurrence(a, b) {
     return Boolean(a.source?.messageId && a.source.messageId === b.source?.messageId);
 }
 
+// 没有话题编号的旧队列仍可彼此核对，不能为已分开的话题搭桥。
+const sameIntakeTopic = (a, b) => a.session === b.session && (a.topicId || '') === (b.topicId || '');
+const nearbyEvidence = (a, b) => sameIntakeTopic(a, b) && a.speakerId === b.speakerId &&
+    Math.abs(Date.parse(a.at) - Date.parse(b.at)) <= 120000;
+
 function assembledEvidence(raw, sources) {
     const primary = sources.find(source => source.id === raw.source_id);
     if (!primary) return null;
@@ -125,19 +132,17 @@ function assembledEvidence(raw, sources) {
         const evidence = text(raw.evidence, 500);
         return evidence && primary.text.includes(evidence) ? { source: primary, evidence } : null;
     }
-    const pool = [...new Map([...(primary.references || []), ...sources].map(source => [source.id, source])).values()]
+    const pool = [...new Map([...(primary.references || []), ...sources].filter(source => nearbyEvidence(source, primary)).map(source => [source.id, source])).values()]
         .map((source, index) => ({ source, index })).sort((a, b) => Date.parse(a.source.at) - Date.parse(b.source.at) || a.index - b.index).map(item => item.source);
     const parts = raw.evidence_parts.slice(0, 8).map(part => {
         const source = pool.find(candidate => candidate.id === part.source_id), evidence = text(part.text, 600);
         return source && evidence && source.text.includes(evidence) ? { source, evidence } : null;
     });
-    if (parts.some(part => !part) || !parts.some(part => part.source.id === primary.id) ||
-        parts.some(part => part.source.session !== primary.session || part.source.speakerId !== primary.speakerId ||
-            Math.abs(Date.parse(part.source.at) - Date.parse(primary.at)) > 120000)) return null;
+    if (parts.some(part => !part) || !parts.some(part => part.source.id === primary.id)) return null;
     const selected = parts.map(part => pool.findIndex(source => source.id === part.source.id));
     // 不能通过漏选中间的新主语/实体，让后面的“它”跳回更早的对象。
-    const unique = pool.slice(Math.min(...selected), Math.max(...selected) + 1).filter(source => source.session === primary.session &&
-        source.speakerId === primary.speakerId).map(source => ({ source, evidence: parts.find(part => part.source.id === source.id)?.evidence || source.text }));
+    const unique = pool.slice(Math.min(...selected), Math.max(...selected) + 1)
+        .map(source => ({ source, evidence: parts.find(part => part.source.id === source.id)?.evidence || source.text }));
     const joined = unique.map(part => part.source.text).join('，');
     if (joined.length > 3000) return null;
     return { source: { ...primary, text: joined, originalTimeUnknown: unique.some(part => part.source.originalTimeUnknown),
@@ -213,10 +218,10 @@ function supportedSummary(content, evidence) {
     return terms.some(term => !weakEvidenceWords.has(term) && evidence.toLowerCase().includes(term.toLowerCase()));
 }
 
-function groundedEntity(entity, evidence, assertion) {
+function groundedEntity(entity, evidence, assertion, anchor) {
     if (!entity || typeof entity !== 'object') return undefined;
-    const name = text(entity.name, 80);
-    if (!name || !evidence.includes(name)) return undefined;
+    const name = text(anchor?.entity.name || entity.name, 80);
+    if (!name || (!anchor && !evidence.includes(name))) return undefined;
     const literal = (value, length) => { const v = text(value, length); return v && evidence.includes(v) ? v : ''; };
     const qualified = value => {
         const supported = literal(value, 300);
@@ -228,9 +233,9 @@ function groundedEntity(entity, evidence, assertion) {
     const positiveOwner = !negativeOwner && /(?:我(?:的|家)|[\u3400-\u9fffA-Za-z0-9]{1,20}的).{0,12}(?:猫|狗|兔|鸟|鼠|鱼|龟)/u.test(evidence);
     const pet = entity.relation === '宠物' && (positiveOwner ||
         (assertion !== 'negated' && assertion !== 'uncertain' && /(?:宠物|养.{0,20}(?:猫|狗|兔|鸟|鼠|鱼|龟))/u.test(evidence)));
-    const kind = literal(entity.kind, 40);
+    const kind = literal(entity.kind, 40) || anchor?.entity.kind || '';
     return { name, kind: kind && new RegExp(`(?:不是|并非|不算)\\s*${escapePattern(kind)}`, 'u').test(evidence) ? '' : kind,
-        relation: pet ? '宠物' : qualified(entity.relation), attributes: qualified(entity.attributes) };
+        relation: pet ? '宠物' : qualified(entity.relation) || (assertion === 'affirmed' ? anchor?.entity.relation || '' : ''), attributes: qualified(entity.attributes) };
 }
 
 function groundedClaim(raw, evidence) {
@@ -277,7 +282,7 @@ function explicitCorrection(previous, next) {
 }
 // 保留旧列表的版本指纹；存储范围改变后旧列表仍会要求重新查看。
 const recordVersion = r => digest(JSON.stringify([r.type, r.subjectId, r.scope?.kind === 'group' ? r.scope.groupId : '', r.content, r.status, r.entity, r.replaces, r.expiresAt,
-    ...(r.scope?.kind === 'private' ? [r.scope.sessionId] : []), ...(r.scope?.shareWhenBound ? ['shareOnBinding'] : [])]));
+    ...(r.scope?.kind === 'private' ? [r.scope.sessionId] : []), ...(r.scope?.shareWhenBound ? ['shareOnBinding'] : []), ...(r.entityRef ? ['entityRef', r.entityRef] : [])]));
 const sendFailed = result => result === false || result === null || Boolean(result?.error) || result?.status === 'failed';
 const legacyOrphan = record => !record.subjectId && !record.source?.speakerId && !record.source?.messageId && !record.source?.quote;
 const DEFAULT_BOT_NAMES = ['呱瓜', '笨瓜', '大笨瓜'];
@@ -331,6 +336,7 @@ export const MEMORY_RULES = `
 - 稳定个人信息绑定userid：同一人在多个群的宠物、生日、长期偏好可共用；群内事件、约定、临时偏好、称呼、关系和梗仅在原群或原私聊使用。不可把某群的安排套到另一个群。
 - 【本群知识】属于当前群的规则、服务器地址、固定活动和明确群梗，不是来源作者的个人资料，不带往其他群。近期状态以有效期和最新原话为准；有较新未确认说法时说明当前状态待核对，不能只坚持旧确认内容。
 - 群成员资格优先于人物识别：只查询当前群已核实的成员；提及、@、旧发言或人工群备注不能证明当前在群。同名、相同宠物名或相似关键词不能证明是同一个人。查询未返回的人物不要自行补出资料。遇到冲突优先用人工资料和主人修正后的记忆。
+- 只有实际收录回执才能证明保存成功；没有回执时自然聊天，不额外承诺“已经记住”，也不为收录反复追问。明确记住的请求以本轮程序提供的结果为准。
 - 只在与当前话题相关时自然使用记忆，不要在闲聊中主动罗列他人的资料。`;
 
 export function parseJsonObject(content) {
@@ -354,7 +360,11 @@ function validData(data) {
         Object.values(data.sessions).every(s => s && typeof s === 'object' && !Array.isArray(s) && Array.isArray(s.history) && Array.isArray(s.pendingSummary) && typeof s.summary === 'string') &&
         Array.isArray(data.observations) && data.people && !Array.isArray(data.people) && typeof data.people === 'object' &&
         data.reminders && typeof data.reminders === 'object' &&
-        (data.reviews == null || (typeof data.reviews === 'object' && !Array.isArray(data.reviews)));
+        (data.reviews == null || (typeof data.reviews === 'object' && !Array.isArray(data.reviews))) &&
+        (data.intakeLog == null || (typeof data.intakeLog === 'object' && !Array.isArray(data.intakeLog) && Object.values(data.intakeLog).every(entry =>
+            entry && typeof entry.id === 'string' && typeof entry.sourceId === 'string' && typeof entry.text === 'string' &&
+            typeof entry.session === 'string' && Array.isArray(entry.recordIds)))) &&
+        (data.nextIntakeId == null || (Number.isInteger(data.nextIntakeId) && data.nextIntakeId > 0));
 }
 
 function freshData() {
@@ -617,22 +627,32 @@ export class MemoryStore {
         const allowed = groupId ? new Set(this.authorize({ ...options, groupId: normalizeId(groupId) })) : null;
         const groupAllowed = Boolean(groupId && this.authorizeGroup({ ...options, groupId: normalizeId(groupId) }));
         const subjects = subjectIds == null ? null : new Set(subjectIds.map(normalizeId));
-        const q = text(query, 2000).toLowerCase();
-        const words = [...new Set(q.match(/[a-z0-9]{2,}|[\u3400-\u9fff]{2,}/g) || [])];
-        const grams = words.flatMap(w => w.length > 3 ? Array.from({ length: w.length - 1 }, (_, i) => w.slice(i, i + 2)) : [w]);
-        const categories = ['猫', '狗', '兔', '仓鼠', '鸟', '鱼', '龟', '宠物', '电脑', '手机', '项目', '作品'].filter(term => q.includes(term));
+        const relevance = input => {
+            const q = text(input, 2000).toLowerCase();
+            const words = [...new Set(q.match(/[a-z0-9]{2,}|[\u3400-\u9fff]{2,}/g) || [])];
+            const grams = words.flatMap(w => w.length > 3 ? Array.from({ length: w.length - 1 }, (_, i) => w.slice(i, i + 2)) : [w]);
+            const categories = ['猫', '狗', '兔', '仓鼠', '鸟', '鱼', '龟', '宠物', '电脑', '手机', '项目', '作品'].filter(term => q.includes(term));
+            return (r, body) => {
+                const matches = grams.reduce((n, w) => n + Number(body.includes(w)), 0);
+                const named = (r.entity?.name && q.includes(r.entity.name.toLowerCase())) || (r.type === 'alias' && q.includes(r.content.toLowerCase()));
+                const category = r.entity && categories.some(term => body.includes(term));
+                return matches * 2 + Number(named) * 8 + Number(Boolean(category)) * 18;
+            };
+        };
+        const scoreQuery = relevance(query), targets = new Set((options.targetUserIds || []).map(normalizeId));
+        const scoreCurrent = targets.size && options.currentQuery !== query ? relevance(options.currentQuery || '') : scoreQuery;
         return this.data.records.filter(r => this.usable(r) && this.inScope(r, groupId, sessionId) &&
+            (!r.entityRef || r.status === 'confirmed' || this.data.records.some(anchor => anchor.id === r.entityRef && anchor.subjectId === r.subjectId && anchor.entity?.name === r.entity?.name && this.usable(anchor) && this.inScope(anchor, groupId, sessionId))) &&
             (!subjects || subjects.has(r.subjectId)) &&
             (groupSubject(r) ? groupAllowed : !allowed || allowed.has(r.subjectId || r.source?.speakerId)))
             .map(r => {
                 const body = `${r.content} ${r.entity?.name || ''} ${r.entity?.kind || ''} ${r.entity?.relation || ''} ${r.entity?.attributes || ''}`.toLowerCase();
-                const matches = grams.reduce((n, w) => n + Number(body.includes(w)), 0);
-                const named = (r.entity?.name && q.includes(r.entity.name.toLowerCase())) || (r.type === 'alias' && q.includes(r.content.toLowerCase()));
-                const category = r.entity && categories.some(term => body.includes(term));
+                const matchScore = scoreQuery(r, body);
+                const priority = targets.has(r.subjectId) && (scoreCurrent === scoreQuery ? matchScore : scoreCurrent(r, body)) > 0;
                 const focused = r.entity?.name && entityNames.includes(r.entity.name);
-                return { record: r, score: Number(ids.has(r.subjectId)) * 8 + matches * 2 + Number(named) * 8 +
-                    Number(Boolean(category)) * 18 + Number(Boolean(focused)) * 18 + Number(r.status === 'confirmed') + Number(Boolean(r.replaces)) * 2 };
-            }).filter(x => x.score > 1).sort((a, b) => b.score - a.score || String(b.record.updatedAt || b.record.createdAt || '').localeCompare(String(a.record.updatedAt || a.record.createdAt || '')))
+                return { record: r, priority, score: Number(ids.has(r.subjectId)) * 8 + matchScore +
+                    Number(Boolean(focused)) * 18 + Number(r.status === 'confirmed') + Number(Boolean(r.replaces)) * 2 };
+            }).filter(x => x.score > 1).sort((a, b) => Number(b.priority) - Number(a.priority) || b.score - a.score || String(b.record.updatedAt || b.record.createdAt || '').localeCompare(String(a.record.updatedAt || a.record.createdAt || '')))
             .slice(0, limit).map(x => clone(x.record));
     }
 
@@ -652,7 +672,7 @@ export class MemoryStore {
         ];
         return groups.map(([status, heading]) => {
             const lines = records.filter(r => r.status === status).map(r =>
-                `- ${r.id} userid=${groupSubject(r) ? '本群知识' : r.subjectId || '对象未确定'}；${LABELS[r.type]}：${r.content}${r.scope.kind === 'group' ? '（仅本群）' : r.scope.kind === 'private' ? '（仅本次私聊）' : '（个人稳定信息）'}${r.replaces ? `；较新说法，待核对旧记忆${r.replaces}` : ''}${changes.has(r.id) ? `；有较新未确认说法${changes.get(r.id)}，当前状态待核对` : ''}；${r.source?.originalTimeUnknown ? '原时间未知，采集时间' : '来源时间'}:${r.source?.at || r.createdAt}${r.expiresAt ? `；有效至:${r.expiresAt}` : ''}`);
+                `- ${r.id} userid=${groupSubject(r) ? '本群知识' : r.subjectId || '对象未确定'}；${LABELS[r.type]}：${r.entityRef && r.entity?.name ? `对象${r.entity.name}；` : ''}${r.content}${r.scope.kind === 'group' ? '（仅本群）' : r.scope.kind === 'private' ? '（仅本次私聊）' : '（个人稳定信息）'}${r.replaces ? `；较新说法，待核对旧记忆${r.replaces}` : ''}${changes.has(r.id) ? `；有较新未确认说法${changes.get(r.id)}，当前状态待核对` : ''}；${r.source?.originalTimeUnknown ? '原时间未知，采集时间' : '来源时间'}:${r.source?.at || r.createdAt}${r.expiresAt ? `；有效至:${r.expiresAt}` : ''}`);
             return lines.length ? `${heading}\n${lines.join('\n')}` : '';
         }).filter(Boolean).join('\n').slice(0, 6500);
     }
@@ -683,9 +703,10 @@ export class MemoryStore {
                     }
                 } else if (action === '修正') {
                     if (!arg.trim()) throw new Error('请填写修正后的内容');
-                    record.revisions = [...(record.revisions || []), { content: record.content, entity: record.entity, status: record.status, at: iso(this.now()) }].slice(-10);
+                    record.revisions = [...(record.revisions || []), { content: record.content, entity: record.entity, ...(record.entityRef ? { entityRef: record.entityRef } : {}), status: record.status, at: iso(this.now()) }].slice(-10);
                     record.content = text(arg);
                     delete record.entity;
+                    delete record.entityRef;
                     record.status = TEMPORARY.has(record.type) ? 'active' : (record.subjectId || groupSubject(record) ? 'confirmed' : 'pending');
                 } else record.status = action === '删除' ? 'deleted' : 'ignored';
                 record.reviewedBy = actor;
@@ -816,6 +837,10 @@ export class MemoryService {
 
     subjectSupported(source, subjectId, fact, currentMembers) {
         if (subjectId && subjectId !== source.speakerId && !currentMembers.includes(subjectId)) return false;
+        // “帮我记一下我家的猫叫豆包”：只去掉原作者自述前的请求语。原话、引用作者和逐字证据仍原样保存。
+        if (source.requested && source.text.startsWith(fact.core)) {
+            fact.core = fact.core.replace(/^(?:你?(?:能不能|能否|可不可以|可否|可以|能))?(?:(?:请|帮我|替我|麻烦你?)\s*)*(?:记住|记下(?:来)?|记一下|记录(?:一下)?|记着)\s*(?=我(?:家|的|养|有|叫|喜欢|住|是|要|明天|今天))/u, '');
+        }
         const botId = source.botId || source.session?.split(':')[0] || 'default';
         const rosterNames = this.roster.names(botId, source.groupId);
         const ids = [...new Set([...currentMembers, source.speakerId])];
@@ -1031,14 +1056,116 @@ export class MemoryService {
         return { id: `${sessionKey(e)}:${id}`, session: sessionKey(e), speakerId: normalizeId(e.user_id),
             groupId: normalizeId(e.group_id), name: text(e.sender?.card || e.sender?.nickname || e.user_id, 60), nickname: text(e.sender?.nickname, 60),
             at: iso(Number.isFinite(timestamp) && timestamp > 0 ? (timestamp < 1e12 ? timestamp * 1000 : timestamp) : this.now()),
-            text: text(content, 3000), botId: sessionKey(e).split(':')[0], targets: (e.message || []).filter(s => s?.type === 'at').map(s => normalizeId(s.qq)) };
+            text: text(content, 3000), ...(String(content || '').trim().length > 3000 ? { truncated: true } : {}),
+            botId: sessionKey(e).split(':')[0], targets: (e.message || []).filter(s => s?.type === 'at').map(s => normalizeId(s.qq)) };
+    }
+
+    updateIntake(data, source, changes = {}) {
+        data.intakeLog ||= {};
+        let entry = data.intakeLog[source.id];
+        if (!entry) {
+            data.nextIntakeId ||= Math.max(0, ...Object.values(data.intakeLog).map(item => Number(item.id?.slice(1)) || 0)) + 1;
+            entry = data.intakeLog[source.id] = { id: `C${String(data.nextIntakeId++).padStart(6, '0')}`,
+                sourceId: source.id, receivedAt: this.now(), state: 'queued', recordIds: [], attempts: 0 };
+            for (const key of ['session', 'speakerId', 'groupId', 'botId', 'name', 'nickname', 'at', 'text', 'targets', 'quoted', 'originalTimeUnknown', 'topicId', 'truncated']) {
+                if (source[key] !== undefined) entry[key] = clone(source[key]);
+            }
+        }
+        Object.assign(entry, changes, { updatedAt: this.now() });
+        return entry;
+    }
+
+    expiredIntakes(data) {
+        const queued = new Set(data.observations.map(source => source.id));
+        const entries = Object.values(data.intakeLog || {}).sort((a, b) => b.receivedAt - a.receivedAt);
+        return entries.filter((entry, index) => {
+            const retention = entry.requested && !['stored', 'suppressed'].includes(entry.state) ? 30 * DAY : 7 * DAY;
+            return !queued.has(entry.sourceId) && (this.now() - entry.receivedAt > retention || index >= 1200);
+        }).map(entry => entry.sourceId);
+    }
+
+    pruneIntakes(data) {
+        for (const id of this.expiredIntakes(data)) delete data.intakeLog[id];
+    }
+
+    sourceFromIntake(entry) {
+        const source = { id: entry.sourceId };
+        for (const key of ['session', 'speakerId', 'groupId', 'botId', 'name', 'nickname', 'at', 'text', 'targets', 'quoted', 'originalTimeUnknown', 'topicId', 'truncated']) {
+            if (entry[key] !== undefined) source[key] = clone(entry[key]);
+        }
+        return source;
+    }
+
+    intakeSources(e, selector = '', limit = 10) {
+        const botId = sessionKey(e).split(':')[0];
+        const id = /^C\d+$/i.test(selector) ? `C${String(Number(selector.slice(1))).padStart(6, '0')}` : '';
+        const expired = new Set(this.expiredIntakes(this.store.data));
+        return Object.values(this.store.data.intakeLog || {}).filter(entry => entry.botId === botId &&
+            !expired.has(entry.sourceId) && (!e.group_id || entry.groupId === normalizeId(e.group_id)) &&
+            (id ? entry.id === id : !selector || `${entry.text} ${entry.name} ${entry.nickname}`.includes(selector)))
+            .sort((a, b) => b.receivedAt - a.receivedAt || b.id.localeCompare(a.id)).slice(0, limit).map(clone);
+    }
+
+    intakeReceipt(sources) {
+        if (!this.store.config.enabled) return '当前记忆提取已关闭，这次没有新增收录。';
+        if (sources.some(source => source.captureError)) return '这次未能保存原话，请稍后再试。';
+        const entries = sources.map(source => this.store.data.intakeLog?.[source.id]).filter(Boolean);
+        if (!entries.length) return '没有取得可收录的原话，请确认引用内容、原作者和当前群范围。';
+        const ids = [...new Set(entries.flatMap(entry => entry.recordIds || []))];
+        const records = ids.map(id => this.store.data.records.find(record => record.id === id)).filter(record => record && this.store.usable(record));
+        if (records.length) {
+            const pending = records.filter(record => record.status === 'pending').length;
+            return `已收录 ${records.length} 条${pending ? `，其中 ${pending} 条待主人确认，可先作为参考` : '可用记忆'}。`;
+        }
+        if (entries.every(entry => entry.state === 'suppressed')) return '这条信息已有忽略或删除设置，本次没有重新收录。';
+        if (entries.some(entry => ['queued', 'processing'].includes(entry.state))) return `原话已保留，还在整理中；主人可用 ${this.memoryCommand} 最近 查看结果。`;
+        const reason = entries.find(entry => entry.reason)?.reason || '尚未整理出可用记忆';
+        return `原话已保留，但没有新增可用记忆：${reason}。主人可用 ${this.memoryCommand} 最近 查看或重试。`;
+    }
+
+    intakeDisplay(e, selector = '') {
+        const detail = /^C\d+$/i.test(selector);
+        const entries = this.intakeSources(e, selector, detail ? 1 : 10);
+        if (!entries.length) return selector ? '没有找到本范围内的收录记录。' : '最近没有保留的收录记录。';
+        const labels = { queued: '等待整理', processing: '正在整理', stored: '已收录', empty: '未提取出记忆',
+            rejected: '需要补充或更正', failed: '整理失败，等待重试', suppressed: '沿用忽略或删除设置', legacy: '旧处理结果未知' };
+        return `${detail ? '🧠 收录详情' : '🧠 最近收录'}\n\n` + entries.map(entry =>
+            `${entry.id}｜${labels[entry.state] || entry.state}｜${this.memberName(entry.speakerId, entry.groupId)}\n` +
+            `${entry.reason ? `说明：${entry.reason}\n` : ''}${entry.recordIds.length ? `相关记忆：${entry.recordIds.join('、')}\n` : ''}` +
+            `${detail ? `来源：${entry.originalTimeUnknown ? `原时间未知；采集于 ${iso(entry.receivedAt)}` : entry.at}${entry.groupId ? `，群 ${entry.groupId}` : '，原私聊'}\n` : ''}` +
+            `原话：${text(entry.text, detail ? 3000 : 130)}${entry.truncated ? '（原消息超长，仅保留前3000字）' : ''}`)
+            .join('\n\n') + `\n\n查看：${this.memoryCommand} 收录 C编号；重试：${this.memoryCommand} 重试 C编号。`;
+    }
+
+    async settleIntakes(sources, valid = () => true) {
+        for (let attempt = 0; attempt < 8 && this.active && valid(); attempt++) {
+            const waiting = sources.some(source => this.store.data.observations.some(item => item.id === source.id && item.readyAt <= this.now()));
+            if (!waiting) break;
+            await this.processExtractions();
+        }
+        return valid() ? this.intakeReceipt(sources) : '';
+    }
+
+    async retryIntake(e, selector) {
+        const entry = this.intakeSources(e, selector, 1)[0];
+        if (!entry) throw Error('没有找到本范围内的收录记录');
+        const bot = this.bots.get(entry.botId) || e.bot;
+        const event = { self_id: entry.botId, bot, group_id: entry.groupId, user_id: entry.speakerId,
+            sender: { card: entry.name, nickname: entry.nickname }, time: Date.parse(entry.at) / 1000,
+            originalTimeUnknown: entry.originalTimeUnknown, message_id: entry.sourceId.slice(entry.session.length + 1) };
+        if (entry.groupId) {
+            await this.roster.ensure(event);
+            if (!this.roster.ids(entry.botId, entry.groupId).includes(entry.speakerId)) throw Error('暂时无法核实原作者当前在群，原话仍保留');
+        }
+        const sources = this.observeMany([{ event, content: entry.text, mode: 'quoted', force: true, requested: true }], { immediate: true });
+        return this.settleIntakes(sources, () => this.active);
     }
 
     observe(e, content, immediate = false) {
         return this.observeMany([{ event: e, content }], { immediate })[0];
     }
 
-    observeMany(items, { immediate = true, context = [] } = {}) {
+    observeMany(items, { immediate = true, context = [], topicId = '', defer = false } = {}) {
         if (!this.active || !this.store.config.enabled || !Array.isArray(items)) return [];
         const normalize = (item, witness) => {
             const e = item?.event;
@@ -1047,21 +1174,36 @@ export class MemoryService {
             if (witness) this.registerBot(e.bot);
             if (witness && !quoted) this.roster.noteMessage(e);
             const source = this.source(e, item.content);
+            if (topicId) source.topicId = topicId;
+            source.force = item.force === true;
+            source.requested = item.requested === true;
             if (this.botIds(source).has(source.speakerId)) return null;
-            if (quoted && (!source.groupId || !this.roster.ids(source.botId, source.groupId).includes(source.speakerId))) return null;
+            if (quoted && (source.groupId ? !this.roster.ids(source.botId, source.groupId).includes(source.speakerId) : source.session !== `${source.botId}:private:${source.speakerId}`)) return null;
             if (quoted) {
                 source.quoted = true;
                 source.originalTimeUnknown = Boolean(e.originalTimeUnknown || !Number(e.time));
+            }
+            const saved = this.store.data.intakeLog?.[source.id];
+            if (saved) {
+                if (saved.speakerId !== source.speakerId || saved.session !== source.session) return null;
+                source.text = saved.text;
+                source.at = saved.at;
+                source.originalTimeUnknown = saved.originalTimeUnknown;
+                source.topicId = saved.topicId;
             }
             return source;
         };
         const sources = items.map(item => normalize(item, true)).filter(Boolean);
         const references = [...sources, ...context.map(item => normalize(item, false)).filter(Boolean)];
         if (!sources.length) return [];
-        this.safe(() => this.store.change(data => {
+        const saved = this.safe(() => { this.store.change(data => {
             data.intakes ||= {};
             for (const [id, at] of Object.entries(data.intakes)) if (this.now() - at > 7 * DAY) delete data.intakes[id];
-            for (const source of sources) {
+            for (const input of sources) {
+                const previous = data.intakeLog?.[input.id];
+                const source = previous ? { ...input, text: previous.text, at: previous.at, topicId: previous.topicId,
+                    originalTimeUnknown: previous.originalTimeUnknown } : input;
+                const entry = this.updateIntake(data, source, { ...(source.requested ? { requested: true } : {}) });
                 if (!source.quoted && !data.intakes[source.id]) {
                     const member = data.people[source.speakerId] ||= {};
                     if (!member.lastSeenAt || source.at >= member.lastSeenAt) {
@@ -1073,22 +1215,31 @@ export class MemoryService {
                         member.namesByGroup[source.groupId] = { ...member.namesByGroup[source.groupId], name: source.name, lastSeenAt: source.at };
                     }
                 }
-                const related = references.filter(reference => reference.id !== source.id && reference.session === source.session &&
-                    reference.speakerId === source.speakerId && Math.abs(Date.parse(reference.at) - Date.parse(source.at)) <= 120000)
+                const related = [...references, ...Object.values(data.intakeLog || {}).filter(reference => source.topicId && reference.topicId === source.topicId)
+                    .map(reference => this.sourceFromIntake(reference))].filter(reference => reference.id !== source.id && nearbyEvidence(reference, source))
                     .filter((reference, index, all) => all.findIndex(other => other.id === reference.id) === index).slice(-8);
                 const queued = data.observations.find(observation => observation.id === source.id);
-                if (queued) { queued.references = related; continue; }
-                if (data.intakes[source.id]) continue;
+                if (queued) { queued.references = related; if (immediate) queued.readyAt = this.now(); if (source.requested) queued.requested = true; continue; }
+                if ((data.intakes[source.id] || previous) && !source.force) {
+                    if (!previous) Object.assign(entry, { state: 'legacy', reason: '此前处理过，但旧版没有保存收录结果，可手动重试' });
+                    continue;
+                }
                 data.intakes[source.id] = this.now();
+                Object.assign(entry, { state: 'queued', reason: '等待整理', updatedAt: this.now() });
                 data.observations.push({ ...source, references: related, readyAt: this.now() + (immediate ? 0 : this.store.config.extractionDelaySeconds * 1000), attempts: 0 });
             }
             const keys = Object.keys(data.intakes);
             for (const id of keys.slice(0, Math.max(0, keys.length - 1200))) delete data.intakes[id];
-            for (const source of sources) if (data.observations.filter(o => o.session === source.session && !o.attempts).length >= this.store.config.extractionBatchSize) {
-                for (const observation of data.observations) if (observation.session === source.session && !observation.attempts) observation.readyAt = this.now();
+            for (const source of sources) if (data.observations.filter(o => sameIntakeTopic(o, source) && !o.attempts).length >= this.store.config.extractionBatchSize) {
+                for (const observation of data.observations) if (sameIntakeTopic(observation, source) && !observation.attempts) observation.readyAt = this.now();
             }
-        }));
-        if (immediate || this.store.data.observations.length >= this.store.config.extractionBatchSize) {
+            this.pruneIntakes(data);
+        }); return true; });
+        if (!saved) {
+            for (const source of sources) source.captureError = true;
+            return sources;
+        }
+        if (!defer && (immediate || this.store.data.observations.length >= this.store.config.extractionBatchSize)) {
             this.processExtractions().catch(error => this.logger.error('[呱瓜记忆] 提取失败：', error.message));
         }
         return sources;
@@ -1109,53 +1260,93 @@ export class MemoryService {
         this.safe(() => this.ingest(records, sources));
     }
 
-    ingest(records, sources) {
+    resolveEntityReference(raw, source, data) {
+        const uid = normalizeId(raw.userid) || source.speakerId;
+        const named = raw.entity?.name && source.text.includes(raw.entity.name);
+        const namedOwner = uid !== source.speakerId && this.names(uid, source.groupId, source.session).some(name =>
+            new RegExp(`^${escapePattern(name)}\\s*(?:的|家)`, 'u').test(source.text));
+        if (!named && !namedOwner && !/^(?:(?:今天|昨天|最近|现在|刚刚|后来|这两天)\s*)*(?:(?:我|我们)(?:的|家|那只|这只)\s*)?(?:它|这只|那只|这台|那台|这个|那个|猫|狗|宠物|电脑|手机|项目|作品)/u.test(source.text)) return null;
+        if (source.groupId && !this.roster.ids(source.botId, source.groupId).includes(uid)) return null;
+        let anchors = data.records.filter(record => record.type === 'entity' && record.subjectId === uid && record.entity?.name &&
+            !record.entityRef && this.store.usable(record) && this.store.inScope(record, source.groupId, source.session));
+        if (named) anchors = anchors.filter(record => record.entity.name === raw.entity.name);
+        const categories = ['猫', '狗', '兔', '鸟', '鱼', '仓鼠', '电脑', '手机', '项目', '作品'].filter(kind => source.text.includes(kind));
+        if (categories.length) anchors = anchors.filter(record => categories.some(kind => `${record.entity.kind} ${record.entity.relation}`.includes(kind)));
+        const focus = this.entityFocus.get(`${source.session}:${source.topicId || ''}:${uid}`);
+        if (!named && focus && this.now() - focus.at < 90000) anchors = anchors.filter(record => focus.names.includes(record.entity.name));
+        const references = (source.references || []).filter(reference => reference.speakerId === uid && reference.session === source.session);
+        const mentioned = anchors.filter(record => references.some(reference => reference.text.includes(record.entity.name)));
+        if (!named && mentioned.length) anchors = mentioned;
+        const distinct = [...new Map(anchors.map(record => [JSON.stringify([record.entity.name, record.entity.kind]), record])).values()];
+        if (distinct.length !== 1) return null;
+        const anchor = distinct[0];
+        if (raw.entity_ref && raw.entity_ref !== anchor.id) return null;
+        if (raw.entity?.name && raw.entity.name !== anchor.entity.name) return null;
+        for (const reference of named ? [] : references) {
+            const named = reference.text.match(/(?:名字叫|名叫|叫做?|名字是)\s*([^，,。！？!?；;\s]{1,20})/u)?.[1];
+            if (named && named !== anchor.entity.name && /猫|狗|兔|鸟|鱼|仓鼠|电脑|手机|项目|作品/u.test(reference.text)) return null;
+            if (!categories.length && /(?:我(?:的|家)|我养|另外|还有).{0,12}(?:猫|狗|兔|鸟|鱼|仓鼠|电脑|手机|项目|作品)/u.test(reference.text) &&
+                !reference.text.includes(anchor.entity.name) && !`${anchor.entity.kind} ${anchor.entity.relation}`.split(/\s+/).filter(Boolean).some(kind => reference.text.includes(kind))) return null;
+        }
+        return anchor;
+    }
+
+    ingest(records, sources, report) {
         if (!Array.isArray(records)) throw new Error('提取结果 memories 必须是数组');
+        if (report) report.items = [];
         return this.store.change(data => {
             let added = 0;
             for (const raw of records.slice(0, 40)) {
-                if (!raw || !TYPES.has(raw.type) || !text(raw.content)) continue;
+                const reject = reason => report?.items.push({ sourceId: raw?.source_id, state: 'rejected', reason });
+                if (!raw || !TYPES.has(raw.type) || !text(raw.content)) { reject('候选内容或类型不完整'); continue; }
                 const assembled = assembledEvidence(raw, sources);
-                if (!assembled) continue;
+                if (!assembled) { reject('候选证据未逐字对应原话，或分句来源不一致'); continue; }
                 const { source, evidence } = assembled;
                 let subjectId = normalizeId(raw.userid);
                 const bots = this.botIds(source);
-                if (bots.has(subjectId) || bots.has(source.speakerId)) continue;
+                if (bots.has(subjectId) || bots.has(source.speakerId)) { reject('机器人呼叫或机器人自身信息不作为成员记忆'); continue; }
                 const proposed = text(raw.content, raw.type === 'alias' ? 40 : 600);
-                if (raw.type === 'alias' && text(raw.content, 100).length > this.maxAliasLen) continue;
-                const fact = evidenceContext(source.text, evidence, raw);
+                if (raw.type === 'alias' && text(raw.content, 100).length > this.maxAliasLen) { reject('称呼超过配置的长度上限'); continue; }
+                const needsReference = raw.type === 'entity' && (raw.entity_ref || (raw.entity?.name && !source.text.includes(raw.entity.name)));
+                const canLinkName = raw.type === 'entity' && raw.claim?.field !== 'ownership' && raw.entity?.name && source.text.includes(raw.entity.name);
+                const entityAnchor = needsReference || canLinkName ? this.resolveEntityReference(raw, source, data) : null;
+                if (needsReference && !entityAnchor) { reject('关联事物不明确，请补充名称；多个候选时不能仅凭代词认定'); continue; }
+                const fact = evidenceContext(source.text, evidence, entityAnchor ? { ...raw, entity: { ...raw.entity, name: '' } } : raw);
                 let support = fact?.text;
-                if (!support || support.length > 1200) continue;
+                if (!support || support.length > 1200) { reject('无法从原话中隔离该事实及其对应对象'); continue; }
                 if (raw.type === 'alias' && (!subjectId || !evidence.includes(proposed) ||
-                    addressOnly(source.text, [...this.botNames, proposed]))) continue;
+                    addressOnly(source.text, [...this.botNames, proposed]))) { reject('称呼没有明确的人物归属，或只是呼叫'); continue; }
                 // 历史原文可记录说话人自身；第三方必须属于该消息的当前群，@及全局建档不能授权。
                 const currentMembers = source.groupId ? this.roster.ids(source.botId || source.session?.split(':')[0] || 'default', source.groupId) : [];
-                if (source.quoted && !currentMembers.includes(source.speakerId)) continue;
+                if (source.quoted && source.groupId && !currentMembers.includes(source.speakerId)) { reject('暂时无法核实引用原作者当前在群'); continue; }
                 const group = raw.subject_kind === 'group' || raw.subjectKind === 'group';
                 if (group) {
                     const personalField = ['residence', 'occupation', 'birthday', 'age', 'identity', 'ownership', 'preference', 'trait'].includes(raw.claim?.field);
                     const groupProof = /(?:群规|本群(?:的)?规则|本群(?:禁止|不允许)|群服务器|本群.{0,16}(?:服务器|IP|地址)|(?:本群|群活动|大家约定|群内固定|群固定).{0,30}(?:每周|每晚|固定|开黑|聚会|活动|时间)|(?:本群|群里|群内).{0,30}(?:梗|典故))/u.test(fact.text);
-                    if (!source.groupId || subjectId || personalField || raw.type === 'alias' || raw.type === 'entity' || firstPersonClaim.test(fact.text) || !groupProof) continue;
+                    if (!source.groupId || subjectId || personalField || raw.type === 'alias' || raw.type === 'entity' || firstPersonClaim.test(fact.text) || !groupProof) { reject('没有明确的本群知识证据，不能将个人资料当作群知识'); continue; }
                     fact.forceLocal = true;
-                } else if (!this.subjectSupported(source, subjectId, fact, currentMembers)) continue;
+                } else if (!this.subjectSupported(source, subjectId, fact, currentMembers)) { reject('事实归属无法核实，或涉及当前范围之外的人物'); continue; }
                 support = fact.text;
                 subjectId ||= fact.subjectId;
                 subjectId ||= '';
-                if (TEMPORARY.has(raw.type) && !subjectId && !group) continue;
+                if (TEMPORARY.has(raw.type) && !subjectId && !group) { reject('近期事项缺少明确主体'); continue; }
                 const temporary = TEMPORARY.has(raw.type);
-                if (source.originalTimeUnknown && (temporary || recentPersonal(fact, support))) continue;
+                if (source.originalTimeUnknown && (temporary || recentPersonal(fact, support))) { reject('引用原时间未知，不能推算相对日期或近期状态'); continue; }
                 const assertion = statementState(support, fact.quotation?.report && subjectId !== source.speakerId ? 'reported' : raw.assertion);
                 const localScope = source.groupId ? { kind: 'group', groupId: normalizeId(source.groupId) } :
                     source.session?.includes(':private:') ? { kind: 'private', sessionId: source.session } : { kind: 'unresolved' };
                 const proto = { type: raw.type, subjectId, scope: localScope, assertion, ...(group ? { subjectKind: 'group' } : {}) };
                 const change = temporary ? this.eventChange(data, raw, proto, source, support) : null;
-                if (change?.handled) continue;
+                if (change?.handled) {
+                    report?.items.push({ sourceId: source.id, state: 'stored', recordId: change.target.id, reason: '已更新原事项状态' });
+                    continue;
+                }
                 // 只有可验收的明确肯定事件免确认；否定、传闻、条件或缺失判断保留在原对话，不进入活动事项。
-                if (temporary && (raw.assertion !== 'affirmed' || assertion !== 'affirmed')) continue;
-                if (raw.type !== 'alias' && !supportedSummary(proposed, support)) continue;
+                if (temporary && (raw.assertion !== 'affirmed' || assertion !== 'affirmed')) { reject('安排尚未明确成立，未生成活动事项'); continue; }
+                if (raw.type !== 'alias' && !supportedSummary(proposed, support)) { reject('候选内容缺少原话支持'); continue; }
                 const content = raw.type === 'alias' ? proposed : text(support, 1200);
-                const entity = raw.type === 'entity' ? groundedEntity(raw.entity, fact.fieldEvidence, assertion) : undefined;
-                if (raw.type === 'entity' && raw.entity?.name && !entity) continue;
+                const entity = raw.type === 'entity' ? groundedEntity(raw.entity || {}, fact.fieldEvidence, assertion, entityAnchor) : undefined;
+                if (raw.type === 'entity' && raw.entity?.name && !entity) { reject('事物名称没有对应到原话中的实体'); continue; }
                 const claim = groundedClaim(raw.claim, support);
                 // 稳定信息必须明确选择 global 且有对应人；事件、约定和自动称呼始终保留会话范围。
                 const global = !group && raw.scope === 'global' && !CONTEXTUAL.has(raw.type) && Boolean(subjectId) && !fact.forceLocal;
@@ -1183,10 +1374,14 @@ export class MemoryService {
                     ...(expiresAt ? { expiresAt } : {})
                 };
                 if (entity) record.entity = entity;
+                if (entityAnchor) record.entityRef = entityAnchor.id;
                 if (claim) record.claim = claim;
                 if (typeof raw.replaces === 'string') record.replaces = raw.replaces;
                 const before = data.records.length;
                 const stored = this.store.addTo(data, record);
+                report?.items.push({ sourceId: source.id, sourceIds: [source.id, ...(source.fragments || []).map(part => part.id)],
+                    state: ['ignored', 'deleted'].includes(stored.status) ? 'suppressed' : 'stored', recordId: stored.id,
+                    reason: ['ignored', 'deleted'].includes(stored.status) ? '这条事实已有忽略或删除设置' : stored.status === 'expired' ? '原事项已超过有效期' : '' });
                 if (change?.target && stored.status === 'active' && stored.id !== change.target.id) {
                     stored.replaces = change.target.id;
                     change.target.status = 'superseded';
@@ -1236,22 +1431,37 @@ export class MemoryService {
     }
 
     async processExtractions() {
+        if (this.extractionTask) return this.extractionTask;
+        const task = this.extractBatch();
+        this.extractionTask = task;
+        try { return await task; }
+        finally { if (this.extractionTask === task) this.extractionTask = null; }
+    }
+
+    async extractBatch() {
         if (!this.active || this.extracting || !this.store.config.enabled) return;
-        const ready = this.store.data.observations.filter(o => o.readyAt <= this.now());
+        const ready = this.store.data.observations.filter(o => o.readyAt <= this.now()).sort((a, b) => Number(Boolean(b.requested)) - Number(Boolean(a.requested)));
         const first = ready[0];
         if (!first) return;
-        const batch = ready.filter(o => o.session === first.session).slice(0, this.store.config.extractionBatchSize);
+        const batch = ready.filter(o => sameIntakeTopic(o, first)).slice(0, this.store.config.extractionBatchSize)
+            .map(o => ({ ...o, references: (o.references || []).filter(ref => nearbyEvidence(ref, o)) }));
         const ids = new Set(batch.map(s => s.id));
         this.extracting = true;
         try {
+            this.store.change(data => {
+                for (const source of batch) {
+                    const entry = this.updateIntake(data, source);
+                    Object.assign(entry, { state: 'processing', reason: '正在整理', attempts: entry.attempts + 1 });
+                }
+            });
             const e = { self_id: first.botId || first.session?.split(':')[0] || 'default', group_id: first.groupId, user_id: first.speakerId };
             e.bot = this.bots.get(normalizeId(e.self_id));
             await this.roster.ensure(e);
             if (!this.active || !this.store.config.enabled) return;
             const context = this.roster.context(e, batch.flatMap(s => [s.speakerId, ...(s.targets || [])]));
             const options = this.recallOptions({ ...context, query: batch.map(s => s.text).join(' '), limit: 16 });
-            const existing = this.store.search(options).map(({ id, type, subjectKind, subjectId, scope, status, content, assertion, entity, claim, expiresAt, source }) =>
-                ({ id, type, subjectKind, subjectId, scope, status, content, assertion, entity, claim, expiresAt,
+            const existing = this.store.search(options).map(({ id, type, subjectKind, subjectId, scope, status, content, assertion, entity, entityRef, claim, expiresAt, source }) =>
+                ({ id, type, subjectKind, subjectId, scope, status, content, assertion, entity, entity_ref: entityRef || (entity ? id : undefined), claim, expiresAt,
                     source: { speakerId: source?.speakerId, at: source?.at, quote: source?.fact || content,
                         ...(source?.originalTimeUnknown ? { originalTimeUnknown: true } : {}) } }));
             const allowed = first.groupId ? new Set(this.memberIds(first.groupId, options)) : null;
@@ -1278,6 +1488,7 @@ content必须是证据直接支持的简短事实，不能添加地点、身份�
 称呼只提取有明确归属的自称、别称或命名关系，必须填写能核实的真实成员userid；无法判断归属就不生成alias，不猜归属，也不新增待绑定称呼。content只填原话中的称呼本身，并让evidence包含该称呼，不要写成“在群内被称呼为…”等推断描述。普通呼叫、提到某人、昵称、群名片或@显示名都不是新增称呼关系。真人明确说“我也叫呱瓜”仍可作为该真人的待确认称呼，不按机器人名字一刀切过滤。
 除event/agreement外全部为待主人确认；事件和约定免确认，有时效。scope必须填写global或group：与userid绑定的宠物、生日、长期偏好等稳定个人信息为global；近期事件、约定、临时偏好、称呼、梗和群内关系必须为group。一个人在多群的稳定信息可共用，但某群的活动和关系不外推到其他群；程序会将遗漏/无效scope保留在原会话。
 本群自身的群规、群服务器地址、固定群活动、明确的群梗来源可用subject_kind="group"、userid=""、scope="group"记录；证据必须明确属于当前群，不能仅因句中出现“本群”就将某人的居住、生日、偏好变成群知识。群知识仍待主人确认，来源作者不是知识主体；个人关系和个人称呼不得冒充群知识。
+已经在knownMemories中建立关联的事物，后续“它/那只猫”的新属性可用entity_ref填写对应的entity_ref编号，entity.name沿用原名，evidence仍逐字填写本次原话；不要把旧事实伪装成本次原话。只有同一成员、当前范围且指代唯一时才关联，多个宠物或话题不明时不要猜。新属性仍待确认。
 messages中的references只作本话题证据参考，不能凭引用给原作者授当前成员资格。一个人连续说“我养了只猫”“它叫豆包”可输出evidence_parts:[{"source_id":"第一句id","text":"我养了只猫"},{"source_id":"新句id","text":"它叫豆包"}]；source_id必须指本批新消息，每个text都须逐字存在对应原话，且合并仅限同一发言人同一会话的相近消息。保留中间主语/实体变化，不能跳过另一只宠物或另一人来认领“它”。不使用evidence_parts时继续提供单条source_id+evidence。不得把参考消息独立重复记入。
 不要把玩笑、猜测、否定句、模型自己的回复当事实；无信息返回memories:[]。每条必须给出原消息source_id和能在该消息中逐字找到的evidence。
 结合每条消息的北京时间理解“明天/下周”；expires_at只在明确时间可判断时填写带+08:00的ISO截止时间，不明确则留空，由程序设置默认期限。绝不要把稳定事实伪装为事件绕过确认。
@@ -1292,14 +1503,34 @@ originalTimeUnknown=true表示引用原时间未知；不得按本次采集时�
             const response = completionMessage(result, { label: '记忆提取' });
             const parsed = parseJsonObject(response.content);
             if (!parsed || !Array.isArray(parsed.memories)) throw new Error('记忆提取JSON不完整，保留原消息待重试');
-            this.ingest(parsed.memories, batch);
-            this.store.change(data => { data.observations = data.observations.filter(o => !ids.has(o.id)); });
+            const report = {};
+            this.ingest(parsed.memories, batch, report);
+            this.store.change(data => {
+                for (const source of batch) {
+                    const outcomes = report.items.filter(item => item.sourceId === source.id || item.sourceIds?.includes(source.id));
+                    const related = data.records.filter(record => record.source?.messageId === source.id || record.source?.fragments?.some(part => part.id === source.id));
+                    const recordIds = [...new Set([...outcomes.map(item => item.recordId), ...related.map(record => record.id)].filter(Boolean))];
+                    const stored = outcomes.some(item => item.state === 'stored') || related.some(record => !['ignored', 'deleted'].includes(record.status));
+                    const suppressed = outcomes.some(item => item.state === 'suppressed') || related.some(record => ['ignored', 'deleted'].includes(record.status));
+                    const rejected = outcomes.find(item => item.state === 'rejected') || report.items.find(item => !ids.has(item.sourceId) && item.state === 'rejected');
+                    this.updateIntake(data, source, { state: stored ? 'stored' : suppressed ? 'suppressed' : rejected ? 'rejected' : 'empty', recordIds,
+                        reason: rejected?.reason || outcomes.find(item => item.reason)?.reason || (stored ? '' : suppressed ? '这条事实已有忽略或删除设置' : '本次未提取出可收录的信息') });
+                }
+                for (const item of report.items.filter(item => item.state === 'stored')) for (const sourceId of item.sourceIds || []) {
+                    if (ids.has(sourceId) || !data.intakeLog?.[sourceId]) continue;
+                    const entry = data.intakeLog[sourceId];
+                    Object.assign(entry, { state: 'stored', recordIds: [...new Set([...entry.recordIds, item.recordId])], reason: '已与后续原话共同收录', updatedAt: this.now() });
+                }
+                data.observations = data.observations.filter(o => !ids.has(o.id));
+                this.pruneIntakes(data);
+            });
         } catch (error) {
             if (this.active) this.safe(() => this.store.change(data => {
                 for (const o of data.observations) if (ids.has(o.id)) {
                     o.attempts += 1;
                     o.readyAt = this.now() + Math.min(3600000, 30000 * 2 ** Math.min(o.attempts, 7));
                     o.lastError = text(error.message, 160);
+                    this.updateIntake(data, o, { state: 'failed', reason: `整理失败，原话保留待重试：${text(error.message, 100)}` });
                 }
             }));
             this.logger.error('[呱瓜记忆] 提取失败，原消息已保留：', error.message);
@@ -1618,6 +1849,7 @@ originalTimeUnknown=true表示引用原时间未知；不得按本次采集时�
             await this.roster.tick();
             if (!this.store.data.migratedProfile) this.safe(() => { this.profileCache = this.getProfile(); this.store.migrate(this.profileCache); });
             this.safe(() => this.store.cleanup());
+            if (this.expiredIntakes(this.store.data).length) this.safe(() => this.store.change(data => this.pruneIntakes(data)));
             await this.notifyPending();
             await this.processExtractions();
             for (const key of Object.keys(this.store.data.sessions)) if (this.store.data.sessions[key].pendingSummary.length) { await this.processSummary(key); break; }

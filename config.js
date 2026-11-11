@@ -113,7 +113,7 @@ export const config = {
   listening: {
     enabled: true,        // 仅在明确聊天或有效引用后接收参与者的短期后续消息
     ttlMs: 60 * 1000,     // 参与者后续消息的准入时长，不是全群监听开关
-    temperature: 0,       // 轻量判断只决定回复/等待/结束，以及哪些消息值得记忆
+    temperature: 0,       // 轻量判断只决定回复/等待/静默/结束，记忆独立批量整理
     maxTokens: 768        // 判断JSON输出预算；等待阶段始终静默
   },
 

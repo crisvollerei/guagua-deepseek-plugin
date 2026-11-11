@@ -144,7 +144,8 @@ test('自定义聊天前缀的显式引用补记仍使用原作者，不误记�
     const quoted = sources.find(source => source.text === '我的猫叫元宝');
     assert.equal(quoted.speakerId, '44444');
     assert.equal(quoted.quoted, true);
-    assert.equal(h.calls.length, 1);
+    assert.equal(h.calls.length, 0);
+    assert.match(JSON.stringify(h.sent), /原话已保留/);
 });
 
 test('自定义资料关键字和帮助文案使用同一套命令配置', async t => {

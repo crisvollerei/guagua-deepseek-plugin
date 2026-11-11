@@ -2,9 +2,10 @@
 export class ConversationListening {
     constructor({ now = Date.now, setTimer = setTimeout, clearTimer = clearTimeout, ttl = 60000,
         current = () => true, judge, reply,
+        capture = (state, message, options) => state.root.handler?.captureListening?.(state, message, options),
         remember = (state, messages, options) => state.root.handler?.rememberListening?.(state, messages, options),
         onError = () => {} } = {}) {
-        Object.assign(this, { now, setTimer, clearTimer, ttl, current, judge, reply, remember, onError });
+        Object.assign(this, { now, setTimer, clearTimer, ttl, current, judge, reply, capture, remember, onError });
         this.sessions = new Map();
         this.focus = new Map();
         this.counter = 0;
@@ -67,8 +68,8 @@ export class ConversationListening {
             input.window && item.scope === input.scope && item.window === input.window && this.valid(item));
         if (!state && input.state && this.byUser(input.scope, input.userId)) return null;
         if (!state) {
-            state = { id: `conversation-${++this.counter}`, scope: input.scope, token: input.token,
-                root: input, participants: new Set(), messages: [], recent: [], history: [], actions: [], seen: new Set(), remembered: new Set(),
+            state = { id: `conversation-${++this.counter}`, startedAt: this.now(), scope: input.scope, token: input.token,
+                root: input, participants: new Set(), messages: [], recent: [], history: [], actions: [], seen: new Set(), remembered: new Set(), memorySources: new Map(),
                 seq: 0, version: 0, handledSeq: 0, evaluatedVersion: -1, busy: false, window: null, entry: input.entry || 'command' };
             if (!this.current(state)) return null;
             this.sessions.set(state.id, state);
@@ -114,6 +115,9 @@ export class ConversationListening {
         state.messages.push(message);
         state.recent = [...state.recent, message].slice(-12);
         state.version++;
+        // 先在本地保存已准入的原话；接话判断不再决定这些话有没有机会被整理。
+        try { this.capture(state, message, { context: state.recent }); }
+        catch (error) { this.onError(error); }
         return message;
     }
 
@@ -227,23 +231,23 @@ export class ConversationListening {
         state.evaluatedVersion = version;
         state.busy = true;
         try {
+            const candidates = [...new Map([...state.recent, ...batch].filter(message => state.participants.has(String(message.userId))).map(message => [message.id, message])).values()];
+            const fresh = batch.filter(message => !state.remembered.has(message.id));
+            if (fresh.length) {
+                const sources = await this.remember(state, fresh, { context: candidates });
+                if (!this.valid(state)) return;
+                if (sources !== false && !(Array.isArray(sources) && sources.some(source => source.captureError))) for (const message of fresh) state.remembered.add(message.id);
+                if (Array.isArray(sources)) for (const message of fresh) state.memorySources.set(message.id,
+                    sources.filter(source => !source.originIds || source.originIds.includes(message.id)));
+                if (state.version !== version) { this.restart(state); return; }
+            }
             const result = await this.judge(state, batch);
             if (!this.valid(state)) return;
             if (!['wait', 'silent', 'reply', 'end'].includes(result?.action)) throw Error('接话判断结果无效');
             // 期限内补充仍可取消旧快照；期限后不再准入新消息，最后的快照必能收尾。
             if (state.version !== version) { this.restart(state); return; }
-            const memoryIds = result.memoryIds || [];
-            const candidates = [...new Map([...state.recent, ...batch].filter(message => state.participants.has(String(message.userId))).map(message => [message.id, message])).values()];
-            if (!Array.isArray(memoryIds) || memoryIds.some(id => !candidates.some(message => message.id === id))) throw Error('记忆判断选择了无效消息');
-            const memoryMessages = candidates.filter(message => memoryIds.includes(message.id));
-            const fresh = memoryMessages.filter(message => !state.remembered.has(message.id));
-            if (fresh.length) {
-                const sources = await this.remember(state, fresh, { context: memoryMessages });
-                if (!this.valid(state)) return;
-                if (sources !== false) for (const message of fresh) state.remembered.add(message.id);
-                result.memorySources = Array.isArray(sources) ? sources : [];
-                if (state.version !== version) { this.restart(state); return; }
-            }
+            // 新补充可能使判断重跑，但已整理消息的回执关联仍属于本批原请求。
+            result.memorySources = batch.flatMap(message => state.memorySources.get(message.id) || []);
             if (result.action === 'end') {
                 for (const id of result.targets || [batch.at(-1).userId]) this.leave(state, id);
                 if (this.valid(state)) {
@@ -266,7 +270,10 @@ export class ConversationListening {
             }
             state.actions = [...state.actions, { action: result.action, through }].slice(-5);
             state.handledSeq = through;
-            for (const message of state.messages) if (message.seq <= through) this.release(message);
+            for (const message of state.messages) if (message.seq <= through) {
+                this.release(message);
+                state.memorySources.delete(message.id);
+            }
             state.messages = state.messages.filter(message => message.seq > through);
             if (state.messages.length) this.restart(state);
             else this.park(state);
@@ -279,7 +286,10 @@ export class ConversationListening {
         state.version++;
         const key = this.focusKey(state.scope, id);
         if (this.focus.get(key) === state) this.focus.delete(key);
-        for (const message of state.messages) if (String(message.userId) === id) this.release(message);
+        for (const message of state.messages) if (String(message.userId) === id) {
+            this.release(message);
+            state.memorySources.delete(message.id);
+        }
         state.messages = state.messages.filter(message => String(message.userId) !== id);
         if (state.turn?.participants.has(id)) {
             state.turn.cancelled = true;

@@ -2118,7 +2118,7 @@ test('普通群聊和引用其他人的消息不会因此进入模型或记忆�
         return message({ memories: [] });
     } });
     await h.instance.chat(h.event('#呱瓜 这是正常提问')); await turn();
-    for (const e of [h.event('群友之间讨论秘密消息'), h.follow('引用其他人的秘密消息', 'someone-else')]) await h.receive(e);
+    for (const e of [h.event('群友之间讨论秘密消息', { user_id: 44444 }), h.follow('引用其他人的秘密消息', 'someone-else')]) await h.receive(e);
     await h.api.memory.processExtractions();
     assert.equal(h.calls.length, 1);
     assert.ok(extracted.includes('这是正常提问'));
@@ -2413,8 +2413,8 @@ test('普通明确提问后无关键词也能续聊，静默前文供理解但�
     const supplied = h.calls[1].messages.at(-1).content;
     assert.match(supplied, /本话题相关前文[\s\S]*为什么你这么麻烦[\s\S]*本轮需要回应的新消息[\s\S]*你倒是说话呀/);
     await h.api.memory.processExtractions();
-    assert.ok(!extracted.some(item => item.text === '你倒是说话呀'));
-    assert.ok(!extracted.some(item => item.text === '为什么你这么麻烦'));
+    assert.ok(extracted.some(item => item.text === '你倒是说话呀'));
+    assert.equal(extracted.filter(item => item.text === '为什么你这么麻烦').length, 1);
     assert.doesNotMatch(JSON.stringify(h.sent), /怎么啦|我在听哦/);
 });
 
@@ -2431,7 +2431,7 @@ test('同批只回答最后一句时相关前文仍送入回答，不把前文�
     assert.equal(h.calls.length, 1);
     assert.match(h.calls[0].messages.at(-1).content, /为什么你这么麻烦[\s\S]*你说话呀/);
     await h.api.memory.processExtractions();
-    assert.deepEqual(extracted.map(item => item.text), []);
+    assert.deepEqual(extracted.map(item => item.text), ['为什么你这么麻烦', '你说话呀']);
 });
 
 test('限时收集仅含参与者，八四二秒后一次判断，不读取整个群历史', async t => {

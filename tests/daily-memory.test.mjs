@@ -180,6 +180,32 @@ test('批量观察原子提取且持久去重，跨消息命名有逐条证据�
     f.service.observeMany([first, second], { immediate: false }); assert.equal(f.store.data.observations.length, 0);
 });
 
+test('同群同人另开话题后，两分钟内的原话也不互相补全；已有队列重启后仍按话题整理', async t => {
+    const batches = [];
+    const f = fixture(t, async params => {
+        batches.push(JSON.parse(params.messages.at(-1).content).messages);
+        return result([]);
+    });
+    const first = { event: f.event('cat-topic'), content: '我养了只猫' };
+    const [a] = f.service.observeMany([first], { topicId: 'A', immediate: false });
+    f.advance(1000);
+    const [b] = f.service.observeMany([{ event: f.event('other-topic'), content: '它叫豆包' }],
+        { topicId: 'B', immediate: false, context: [first] });
+    assert.deepEqual(f.store.data.observations[1].references, []);
+    const proposed = cat(b, { content: '猫叫豆包', evidence_parts: [
+        { source_id: a.id, text: a.text }, { source_id: b.id, text: b.text }] });
+    assert.equal(f.service.ingest([proposed], [a, b]), 0);
+    assert.equal(f.service.ingest([proposed], [{ ...b, references: [{ ...a, topicId: undefined }] }]), 0);
+    // 模拟升级前已经入队的跨话题参考。
+    f.store.change(data => { data.observations[1].references = [a]; });
+    f.reload(); f.advance(31000);
+    await f.service.processExtractions(); await f.service.processExtractions();
+    assert.deepEqual(batches.map(batch => batch.map(source => source.id)), [[a.id], [b.id]]);
+    assert.deepEqual(batches[1][0].references, []);
+    assert.equal(f.service.ingest([proposed], [{ ...a, topicId: b.topicId }, b]), 1);
+    assert.deepEqual(f.store.data.records[0].source.fragments.map(part => part.id), [a.id, b.id]);
+});
+
 test('引用稳定资料不作为当前发言witness；缺原时间的相对安排不入活动', t => {
     const f = fixture(t); f.service.roster.noteMessage(f.event('red', '44444'));
     const quoted = f.event('quoted', '44444'); delete quoted.time; quoted.originalTimeUnknown = true;

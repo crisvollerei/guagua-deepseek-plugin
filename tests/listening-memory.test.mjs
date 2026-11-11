@@ -41,7 +41,7 @@ test('silent也可记明确宠物事实，不生成正式回复且不增加一�
     assert.equal(pet.subjectId, '33333');
     assert.equal(pet.source.speakerId, '33333');
     assert.equal(pet.status, 'pending');
-    assert.match(h.judgments[0].messages[0].content, /memory_message_ids独立于是否接话/);
+    assert.match(h.judgments[0].messages[0].content, /原话的保存和记忆整理独立进行/);
 });
 
 test('wait分句可连同原上下句独立记忆，已观察前句不重新入队', async t => {
@@ -65,7 +65,7 @@ test('wait分句可连同原上下句独立记忆，已观察前句不重新入�
     assert.equal(h.sent.length, 1);
 });
 
-test('记忆选择独立于回复选择，只有memory_message_ids明确选中的前文进入观察', async t => {
+test('话题批次原话独立于回复选择保留，普通问题不因未被选为记忆而丢失', async t => {
     const clock = new FakeClock(), extracted = [];
     const h = quotedHarness(t, { listeningClock: clock, extraction: capture(extracted), judgment: params => {
         const input = inputOf(params);
@@ -78,7 +78,7 @@ test('记忆选择独立于回复选择，只有memory_message_ids明确选中�
     await clock.advance(12000); await drain(h);
     const texts = extracted.flatMap(batch => batch.messages.map(source => source.text));
     assert.ok(texts.includes('我养的猫叫豆包'));
-    assert.ok(!texts.includes('你觉得怎么样'));
+    assert.ok(texts.includes('你觉得怎么样'));
     assert.equal(h.calls.length, 2);
 });
 
@@ -112,19 +112,19 @@ test('没有窗口、无关成员、其他群和其他插件命令均不进入�
     assert.equal(extracted.length, 0);
 });
 
-test('伪造memory消息编号和非数组选择不能观察任何消息', async t => {
+test('旧memory选择字段不再控制收录，也不能带入别的话题消息', async t => {
     for (const ids of [['other-topic:m1'], 'not-an-array']) {
         const clock = new FakeClock(), extracted = [];
         const h = quotedHarness(t, { listeningClock: clock, extraction: capture(extracted), judgment: () => message({ action: 'silent', memory_message_ids: ids }) });
         await h.instance.chat(h.event('#呱瓜 开始')); await drain(h); extracted.length = 0;
         await h.instance.accept(h.event('我的猫叫豆包'));
         await clock.advance(8000); await drain(h);
-        assert.equal(extracted.length, 0);
-        assert.equal(h.api.conversationListening.sessions.size, 0);
+        assert.deepEqual(extracted.flatMap(batch => batch.messages.map(source => source.text)), ['我的猫叫豆包']);
+        assert.doesNotMatch(JSON.stringify(extracted), /other-topic|not-an-array/);
     }
 });
 
-test('判断未完成时重置，迟到memory选择不入库也不重新开启窗口', async t => {
+test('重置保留此前已准入的原话，迟到判断不能回复或重开窗口', async t => {
     const clock = new FakeClock(), began = deferred(), finish = deferred(), extracted = [];
     const h = quotedHarness(t, { listeningClock: clock, extraction: capture(extracted), judgment: params => { began.resolve(inputOf(params)); return finish.promise; } });
     await h.instance.chat(h.event('#呱瓜 开始')); await drain(h); extracted.length = 0;
@@ -132,7 +132,8 @@ test('判断未完成时重置，迟到memory选择不入库也不重新开启�
     const pending = clock.advance(8000), input = await began.promise;
     await h.instance.reset(h.event('#结束对话'));
     finish.resolve(message({ action: 'silent', memory_message_ids: input.messages.map(item => item.id) })); await pending; await drain(h);
-    assert.equal(extracted.length, 0);
+    assert.equal(extracted.flatMap(batch => batch.messages).filter(source => source.text === '我的猫叫豆包').length, 1);
+    assert.equal(h.calls.length, 1);
     assert.equal(h.api.conversationListening.sessions.size, 0);
 });
 
@@ -169,7 +170,7 @@ test('共享判断期间某人另开话题，过时memory选择不关闭其他�
     await clock.advance(8000); await drain(h);
     assert.equal(h.judgments.length, 2);
     const sources = extracted.flatMap(batch => batch.messages);
-    assert.equal(sources.filter(source => source.text === '我的猫叫豆包').length, 0);
+    assert.equal(sources.filter(source => source.text === '我的猫叫豆包').length, 1);
     assert.equal(sources.filter(source => source.text === '我的狗叫元宝' && source.speakerId === '44444').length, 1);
 });
 
